@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: robina-backend
+    name: robina-fastapi
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
