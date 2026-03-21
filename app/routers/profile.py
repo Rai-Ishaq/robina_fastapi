@@ -14,10 +14,20 @@ from app.core.config import settings
 from datetime import datetime, date
 import os
 import uuid
-import shutil
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/profile", tags=["Profile"])
+
+# ✅ Cloudinary setup
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", ""),
+    api_key=os.environ.get("CLOUDINARY_API_KEY", ""),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET", ""),
+    secure=True
+)
 
 def calculate_age(dob: date) -> int:
     today = date.today()
@@ -95,10 +105,7 @@ def save_step1(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    profile = db.query(Profile).filter(
-        Profile.user_id == current_user.id
-    ).first()
-
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.date_of_birth = data.date_of_birth
     profile.height_cm = data.height_cm
     profile.weight_kg = data.weight_kg
@@ -109,7 +116,6 @@ def save_step1(
         profile.setup_step = 1
     profile.updated_at = datetime.utcnow()
     db.commit()
-
     return {"message": "Step 1 saved", "setup_step": profile.setup_step}
 
 # ── STEP 2 ────────────────────────────────────────────────────
@@ -119,10 +125,7 @@ def save_step2(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    profile = db.query(Profile).filter(
-        Profile.user_id == current_user.id
-    ).first()
-
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.house_ownership = data.house_ownership
     profile.house_size = data.house_size
     profile.country = data.country
@@ -131,7 +134,6 @@ def save_step2(
         profile.setup_step = 2
     profile.updated_at = datetime.utcnow()
     db.commit()
-
     return {"message": "Step 2 saved", "setup_step": profile.setup_step}
 
 # ── STEP 3 ────────────────────────────────────────────────────
@@ -141,10 +143,7 @@ def save_step3(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    profile = db.query(Profile).filter(
-        Profile.user_id == current_user.id
-    ).first()
-
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.sect = data.sect
     profile.family_status = data.family_status
     profile.family_values = data.family_values
@@ -153,7 +152,6 @@ def save_step3(
         profile.setup_step = 3
     profile.updated_at = datetime.utcnow()
     db.commit()
-
     return {"message": "Step 3 saved", "setup_step": profile.setup_step}
 
 # ── STEP 4 ────────────────────────────────────────────────────
@@ -163,10 +161,7 @@ def save_step4(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    profile = db.query(Profile).filter(
-        Profile.user_id == current_user.id
-    ).first()
-
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.education = data.education
     profile.institution_name = data.institution_name
     profile.profession = data.profession
@@ -176,7 +171,6 @@ def save_step4(
         profile.setup_step = 4
     profile.updated_at = datetime.utcnow()
     db.commit()
-
     return {"message": "Step 4 saved", "setup_step": profile.setup_step}
 
 # ── STEP 5 ────────────────────────────────────────────────────
@@ -186,10 +180,7 @@ def save_step5(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    profile = db.query(Profile).filter(
-        Profile.user_id == current_user.id
-    ).first()
-
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.dietary_preference = data.dietary_preference
     profile.exercise_habits = data.exercise_habits
     profile.smoking = data.smoking
@@ -198,79 +189,66 @@ def save_step5(
         profile.setup_step = 5
     profile.updated_at = datetime.utcnow()
     db.commit()
-
     return {"message": "Step 5 saved", "setup_step": profile.setup_step}
 
-# ── UPLOAD PHOTO ──────────────────────────────────────────────
+# ── UPLOAD PHOTO — Cloudinary ─────────────────────────────────
 @router.post("/upload-photo", response_model=dict)
 def upload_photo(
     file: UploadFile = File(...),
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    allowed = ["image/jpeg", "image/png", "image/jpg"]
+    allowed = ["image/jpeg", "image/png", "image/jpg", "image/webp"]
     if file.content_type not in allowed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only JPEG and PNG images allowed"
         )
 
-    from PIL import Image
-    import io
+    try:
+        # ✅ Cloudinary pe upload karo
+        contents = file.file.read()
 
-    upload_dir = f"{settings.UPLOAD_DIR}/profiles"
-    os.makedirs(upload_dir, exist_ok=True)
-
-    filename = f"{uuid.uuid4()}.jpg"
-    filepath = f"{upload_dir}/{filename}"
-
-    # Read and compress
-    contents = file.file.read()
-    image = Image.open(io.BytesIO(contents))
-
-    # Convert to RGB if needed
-    if image.mode in ("RGBA", "P"):
-        image = image.convert("RGB")
-
-    # Resize — max 800x800
-    max_size = (800, 800)
-    image.thumbnail(max_size, Image.LANCZOS)
-
-    # Save compressed
-    image.save(filepath, "JPEG", quality=85, optimize=True)
-
-    profile = db.query(Profile).filter(
-        Profile.user_id == current_user.id
-    ).first()
-
-    # Delete old photo
-    if profile.profile_photo:
-        old_path = profile.profile_photo.replace(
-            settings.BASE_URL + "/", ""
+        result = cloudinary.uploader.upload(
+            contents,
+            folder="robina_profiles",
+            public_id=f"user_{current_user.id}",
+            overwrite=True,
+            transformation=[
+                {"width": 800, "height": 800, "crop": "limit"},
+                {"quality": "auto:good"},
+                {"fetch_format": "auto"}
+            ]
         )
-        if os.path.exists(old_path):
-            os.remove(old_path)
 
-    photo_url = f"{settings.BASE_URL}/uploads/profiles/{filename}"
-    profile.profile_photo = photo_url
-    db.commit()
+        photo_url = result["secure_url"]
 
-    return {
-        "message": "Photo uploaded successfully",
-        "photo_url": photo_url
-    }
+        # ✅ Database update karo
+        profile = db.query(Profile).filter(
+            Profile.user_id == current_user.id
+        ).first()
+        profile.profile_photo = photo_url
+        db.commit()
 
-# ── STEP 6 (COMPLETE PROFILE) ─────────────────────────────────
+        return {
+            "message": "Photo uploaded successfully",
+            "photo_url": photo_url
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Upload failed: {str(e)}"
+        )
+
+# ── STEP 6 ────────────────────────────────────────────────────
 @router.put("/step/6", response_model=dict)
 def save_step6(
     data: ProfileStep6,
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    profile = db.query(Profile).filter(
-        Profile.user_id == current_user.id
-    ).first()
-
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.pref_age_min = data.pref_age_min
     profile.pref_age_max = data.pref_age_max
     profile.pref_caste = data.pref_caste
@@ -291,10 +269,7 @@ def save_step6(
         "profile_complete": True
     }
 
-# ── UPDATE NAME & TAGLINE ─────────────────────────────────────
 # ── UPDATE NAME ───────────────────────────────────────────────
-
-
 class UpdateBasicRequest(BaseModel):
     full_name: str
 
@@ -308,8 +283,7 @@ def update_basic(
     db.commit()
     return {"message": "Profile updated successfully"}
 
-# ── VIEW PROFILE (track views) ────────────────────────────────
-# ── VIEW PROFILE (track views properly) ──────────────────────
+# ── VIEW PROFILE ──────────────────────────────────────────────
 @router.get("/{user_id}")
 def get_profile(
     user_id: str,
@@ -321,16 +295,10 @@ def get_profile(
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    profile = db.query(Profile).filter(
-        Profile.user_id == user_id
-    ).first()
+    profile = db.query(Profile).filter(Profile.user_id == user_id).first()
 
-    # Track view — avoid duplicate in last 1 hour
     if str(current_user.id) != user_id:
         one_hour_ago = datetime.utcnow() - timedelta(hours=1)
         recent_view = db.query(ProfileView).filter(
@@ -340,10 +308,7 @@ def get_profile(
         ).first()
 
         if not recent_view:
-            view = ProfileView(
-                viewer_id=current_user.id,
-                viewed_id=user_id
-            )
+            view = ProfileView(viewer_id=current_user.id, viewed_id=user_id)
             db.add(view)
             if profile:
                 profile.profile_views += 1
