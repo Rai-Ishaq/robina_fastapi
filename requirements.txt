@@ -17,3 +17,4 @@ httpx==0.27.0
 email-validator==2.1.0
 cloudinary
 cloudinary
+firebase-admin==7.3.0
