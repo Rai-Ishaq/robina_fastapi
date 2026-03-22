@@ -19,11 +19,15 @@ from app.utils.helpers import get_current_user
 import firebase_admin
 from firebase_admin import auth as firebase_auth, credentials
 import os
+import json
 
-# ── Firebase Admin Init (agar pehle se nahi hua) ─────────────
+# ── Firebase Admin Init ───────────────────────────────────────
 if not firebase_admin._apps:
-    cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase_service_account.json")
-    cred = credentials.Certificate(cred_path)
+    firebase_creds = os.getenv("FIREBASE_CREDENTIALS")
+    if firebase_creds:
+        cred = credentials.Certificate(json.loads(firebase_creds))
+    else:
+        cred = credentials.Certificate("firebase_service_account.json")
     firebase_admin.initialize_app(cred)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -212,7 +216,7 @@ def google_signin(request: GoogleSignInRequest, db: Session = Depends(get_db)):
             email=email,
             phone="",
             country_code="+92",
-            password_hash=hash_password(google_uid),  # Google UID as placeholder
+            password_hash=hash_password(google_uid),
             gender="male",  # Default — profile setup mein update hoga
             is_verified=True,
             google_uid=google_uid,
