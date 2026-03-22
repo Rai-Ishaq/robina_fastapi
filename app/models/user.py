@@ -27,6 +27,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
+    fcm_token = Column(String(500), nullable=True)
 
     # Relationships
     profile = relationship("Profile", back_populates="user", uselist=False)

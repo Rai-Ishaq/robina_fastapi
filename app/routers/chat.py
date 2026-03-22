@@ -9,6 +9,7 @@ from app.models.profile import Profile
 from app.schemas.message import SendMessageRequest
 from app.utils.helpers import get_verified_user
 from app.core.security import decode_token
+from app.services.firebase import send_push_notification
 from datetime import datetime
 from typing import Dict, List
 import json
@@ -62,7 +63,6 @@ async def websocket_endpoint(
 
     db = SessionLocal()
     try:
-        # Update last seen
         user = db.query(User).filter(User.id == user_id).first()
         if user:
             user.last_seen = datetime.utcnow()
@@ -116,10 +116,8 @@ async def websocket_endpoint(
                 db.add(msg)
                 conversation.updated_at = datetime.utcnow()
 
-                # Notification
-                sender = db.query(User).filter(
-                    User.id == user_id
-                ).first()
+                # DB Notification
+                sender = db.query(User).filter(User.id == user_id).first()
                 notif = Notification(
                     user_id=receiver_id,
                     type=NotifType.message,
@@ -127,6 +125,21 @@ async def websocket_endpoint(
                 )
                 db.add(notif)
                 db.commit()
+
+                # ── FCM PUSH NOTIFICATION ──────────────────
+                receiver = db.query(User).filter(User.id == receiver_id).first()
+                if receiver and receiver.fcm_token and not manager.is_online(receiver_id):
+                    send_push_notification(
+                        fcm_token=receiver.fcm_token,
+                        title=sender.full_name,
+                        body=content[:100],
+                        data={
+                            "type": "message",
+                            "sender_id": user_id,
+                            "conversation_id": str(conversation.id)
+                        }
+                    )
+                # ──────────────────────────────────────────
 
                 msg_payload = {
                     "type": "new_message",
@@ -138,9 +151,7 @@ async def websocket_endpoint(
                     "created_at": str(msg.created_at)
                 }
 
-                # Send to receiver if online
                 await manager.send_to_user(receiver_id, msg_payload)
-                # Send back to sender
                 await manager.send_to_user(user_id, msg_payload)
 
             elif msg_type == "seen":
@@ -216,10 +227,7 @@ def get_conversations(
             else conv.user1_id
         )
 
-        other_user = db.query(User).filter(
-            User.id == other_id
-        ).first()
-
+        other_user = db.query(User).filter(User.id == other_id).first()
         if not other_user:
             continue
 
@@ -242,8 +250,7 @@ def get_conversations(
             "other_user_id": str(other_id),
             "other_user_name": other_user.full_name,
             "other_user_photo": (
-                other_profile.profile_photo
-                if other_profile else None
+                other_profile.profile_photo if other_profile else None
             ),
             "is_online": manager.is_online(str(other_id)),
             "last_seen": str(other_user.last_seen),
@@ -285,7 +292,6 @@ def get_messages(
         Message.created_at.desc()
     ).offset((page - 1) * limit).limit(limit).all()
 
-    # Mark as seen
     db.query(Message).filter(
         Message.conversation_id == conversation_id,
         Message.sender_id != current_user.id,
@@ -381,6 +387,21 @@ def send_message(
     )
     db.add(notif)
     db.commit()
+
+    # ── FCM PUSH NOTIFICATION ──────────────────
+    receiver = db.query(User).filter(User.id == request.receiver_id).first()
+    if receiver and receiver.fcm_token:
+        send_push_notification(
+            fcm_token=receiver.fcm_token,
+            title=current_user.full_name,
+            body=request.content[:100],
+            data={
+                "type": "message",
+                "sender_id": str(current_user.id),
+                "conversation_id": str(conversation.id)
+            }
+        )
+    # ──────────────────────────────────────────
 
     return {
         "id": str(msg.id),
