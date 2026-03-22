@@ -9,13 +9,22 @@ from app.schemas.auth import (
     SignupRequest, LoginRequest, OTPVerifyRequest,
     ResendOTPRequest, ForgotPasswordRequest,
     ResetPasswordRequest, ChangePasswordRequest,
-    TokenResponse, MessageResponse
+    TokenResponse, MessageResponse, GoogleSignInRequest
 )
 from app.core.security import (
     hash_password, verify_password, create_access_token
 )
 from app.core.email import generate_otp, send_otp_email
 from app.utils.helpers import get_current_user
+import firebase_admin
+from firebase_admin import auth as firebase_auth, credentials
+import os
+
+# ── Firebase Admin Init (agar pehle se nahi hua) ─────────────
+if not firebase_admin._apps:
+    cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase_service_account.json")
+    cred = credentials.Certificate(cred_path)
+    firebase_admin.initialize_app(cred)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -79,7 +88,6 @@ def signup(request: SignupRequest, db: Session = Depends(get_db)):
 # ── VERIFY OTP ────────────────────────────────────────────────
 @router.post("/verify-otp", response_model=MessageResponse)
 def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
-    # Get latest unused OTP
     otp = db.query(OTP).filter(
         OTP.email == request.email,
         OTP.code == request.otp,
@@ -93,7 +101,6 @@ def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
             detail="Invalid or expired OTP"
         )
 
-    # Mark OTP used
     otp.is_used = True
 
     if request.flow == "signup":
@@ -115,7 +122,6 @@ def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
 # ── RESEND OTP ────────────────────────────────────────────────
 @router.post("/resend-otp", response_model=MessageResponse)
 def resend_otp(request: ResendOTPRequest, db: Session = Depends(get_db)):
-    # Invalidate old OTPs
     db.query(OTP).filter(
         OTP.email == request.email,
         OTP.is_used == False
@@ -157,7 +163,6 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             detail="Account is deactivated"
         )
 
-    # Update last seen
     user.last_seen = datetime.utcnow()
     db.commit()
 
@@ -175,18 +180,78 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         full_name=user.full_name
     )
 
+# ── GOOGLE SIGN IN ────────────────────────────────────────────
+@router.post("/google-signin", response_model=TokenResponse)
+def google_signin(request: GoogleSignInRequest, db: Session = Depends(get_db)):
+    # Firebase se token verify karo
+    try:
+        decoded_token = firebase_auth.verify_id_token(request.id_token)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Google token"
+        )
+
+    email = decoded_token.get("email")
+    full_name = decoded_token.get("name", "User")
+    google_uid = decoded_token.get("uid")
+
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email not found in Google token"
+        )
+
+    # User pehle se hai ya naya banao
+    user = db.query(User).filter(User.email == email).first()
+
+    if not user:
+        # Naya user banao
+        user = User(
+            full_name=full_name,
+            email=email,
+            phone="",
+            country_code="+92",
+            password_hash=hash_password(google_uid),  # Google UID as placeholder
+            gender="male",  # Default — profile setup mein update hoga
+            is_verified=True,
+            google_uid=google_uid,
+        )
+        db.add(user)
+        db.flush()
+
+        # Empty profile banao
+        profile = Profile(user_id=user.id, setup_step=0)
+        db.add(profile)
+        db.commit()
+    else:
+        # Existing user — google_uid save karo agar nahi hai
+        if not user.google_uid:
+            user.google_uid = google_uid
+        user.last_seen = datetime.utcnow()
+        db.commit()
+
+    token = create_access_token(data={"sub": str(user.id)})
+
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user_id=str(user.id),
+        is_verified=user.is_verified,
+        profile_complete=user.profile_complete,
+        full_name=user.full_name
+    )
+
 # ── FORGOT PASSWORD ───────────────────────────────────────────
 @router.post("/forgot-password", response_model=MessageResponse)
 def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == request.email).first()
     if not user:
-        # Security: don't reveal if email exists
         return MessageResponse(
             message="If this email exists, OTP has been sent",
             success=True
         )
 
-    # Invalidate old OTPs
     db.query(OTP).filter(
         OTP.email == request.email,
         OTP.is_used == False
@@ -209,10 +274,8 @@ def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db
     )
 
 # ── RESET PASSWORD ────────────────────────────────────────────
-# ── RESET PASSWORD ────────────────────────────────────────────
 @router.post("/reset-password", response_model=MessageResponse)
 def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
-    # ✅ is_used == True check karo — kyunki verify-otp ne already mark kiya
     otp = db.query(OTP).filter(
         OTP.email == request.email,
         OTP.code == request.otp,
@@ -225,15 +288,13 @@ def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db))
             detail="Invalid or expired OTP"
         )
 
-    # ✅ 10 min window check — expires_at ke baad bhi 10 min allow
     if otp.expires_at < datetime.utcnow() - timedelta(minutes=10):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="OTP has expired. Please request a new one."
         )
 
-    user = db.query(User).filter(
-        User.email == request.email).first()
+    user = db.query(User).filter(User.email == request.email).first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -247,6 +308,7 @@ def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db))
         message="Password reset successfully",
         success=True
     )
+
 # ── CHANGE PASSWORD ───────────────────────────────────────────
 @router.post("/change-password", response_model=MessageResponse)
 def change_password(

@@ -40,6 +40,9 @@ class LoginRequest(BaseModel):
     password: str
     remember_me: bool = False
 
+class GoogleSignInRequest(BaseModel):
+    id_token: str
+
 class OTPVerifyRequest(BaseModel):
     email: EmailStr
     otp: str
