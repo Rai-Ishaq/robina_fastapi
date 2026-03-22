@@ -1,8 +1,17 @@
 import firebase_admin
 from firebase_admin import credentials, messaging
+import os
+import json
 
 if not firebase_admin._apps:
-    cred = credentials.Certificate("firebase_service_account.json")
+    creds_json = os.environ.get("FIREBASE_CREDENTIALS")
+    if creds_json:
+        # Render par — env variable se
+        cred_dict = json.loads(creds_json)
+        cred = credentials.Certificate(cred_dict)
+    else:
+        # Local — file se
+        cred = credentials.Certificate("firebase_service_account.json")
     firebase_admin.initialize_app(cred)
 
 def send_push_notification(fcm_token: str, title: str, body: str, data: dict = {}):
