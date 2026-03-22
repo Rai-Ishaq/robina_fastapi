@@ -16,10 +16,10 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     full_name = Column(String(100), nullable=False)
     email = Column(String(255), unique=True, nullable=False, index=True)
-    phone = Column(String(20), unique=True, nullable=False)
+    phone = Column(String(20), unique=True, nullable=True)  # ✅ Google users ke liye nullable
     country_code = Column(String(10), default="+92")
     password_hash = Column(String(255), nullable=False)
-    gender = Column(Enum(GenderEnum), nullable=False)
+    gender = Column(Enum(GenderEnum), nullable=True)  # ✅ Google users ke liye nullable
     is_verified = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
     is_premium = Column(Boolean, default=False)
@@ -28,6 +28,7 @@ class User(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
     fcm_token = Column(String(500), nullable=True)
+    google_uid = Column(String(128), nullable=True, unique=True)  # ✅ Google Sign In
 
     # Relationships
     profile = relationship("Profile", back_populates="user", uselist=False)
