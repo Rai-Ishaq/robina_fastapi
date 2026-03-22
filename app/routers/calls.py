@@ -223,7 +223,7 @@ def get_call_history(
                     Profile.user_id == other_id
                 ).first()
                 if profile:
-                    other_name = profile.full_name
+                    other_name = getattr(profile, "full_name", None)
                     other_photo = profile.profile_photo
             except Exception as e:
                 logger.error(f"Profile fetch error: {e}")
