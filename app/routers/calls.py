@@ -105,6 +105,30 @@ async def initiate_call(
     except Exception as e:
         logger.error(f"WebSocket notify error: {e}")
 
+    # ✅ FCM Push Notification — agar receiver offline hai
+    try:
+        from app.services.firebase import send_push_notification
+        receiver = db.query(User).filter(
+            User.id == uuid_lib.UUID(receiver_id)
+        ).first()
+        if receiver and receiver.fcm_token:
+            send_push_notification(
+                fcm_token=receiver.fcm_token,
+                title=f"📞 Incoming {call_type.capitalize()} Call",
+                body=f"{current_user.full_name} is calling you",
+                data={
+                    "type": "call",
+                    "call_type": call_type,
+                    "caller_id": str(current_user.id),
+                    "caller_name": current_user.full_name,
+                    "channel_id": channel_name,
+                    "call_log_id": call_log_id or "",
+                }
+            )
+            logger.info(f"FCM call notification sent to {receiver_id}")
+    except Exception as e:
+        logger.error(f"FCM call notification error: {e}")
+
     return {
         "message": "Call initiated",
         "channel_name": channel_name,
@@ -149,6 +173,24 @@ async def end_call(
     except Exception as e:
         logger.error(f"End call error: {e}")
     return {"message": "Call ended"}
+
+
+# ── Call decline ──────────────────────────────────────────────
+@router.post("/decline")
+async def decline_call(
+    call_log_id: str,
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db)
+):
+    from app.models.call_log import CallLog, CallStatus
+    try:
+        log = db.query(CallLog).filter(CallLog.id == uuid_lib.UUID(call_log_id)).first()
+        if log:
+            log.status = CallStatus.declined
+            db.commit()
+    except Exception as e:
+        logger.error(f"Decline call error: {e}")
+    return {"message": "Call declined"}
 
 
 # ── Call history ──────────────────────────────────────────────
@@ -204,7 +246,6 @@ def get_call_history(
             # ✅ created_at UTC se ISO format mein bhejo
             created_at_str = None
             if log.created_at:
-                # Ensure it's treated as UTC
                 dt = log.created_at
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
