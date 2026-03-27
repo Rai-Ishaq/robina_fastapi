@@ -8,6 +8,7 @@ from app.services.firebase import send_push_notification
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
+
 @router.post("/save-token")
 def save_fcm_token(
     token_data: dict,
@@ -20,6 +21,7 @@ def save_fcm_token(
     current_user.fcm_token = fcm_token
     db.commit()
     return {"message": "FCM token saved"}
+
 
 @router.post("/test-push")
 def test_push(
@@ -35,6 +37,7 @@ def test_push(
         data={"type": "test"}
     )
     return {"success": success}
+
 
 @router.get("/")
 def get_notifications(
@@ -55,6 +58,33 @@ def get_notifications(
         for n in notifs
     ]
 
+
+@router.put("/read-all")
+def mark_all_read(
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db)
+):
+    db.query(Notification).filter(
+        Notification.user_id == current_user.id,
+        Notification.is_read == False
+    ).update({"is_read": True})
+    db.commit()
+    return {"message": "All marked as read"}
+
+
+# FIX: clear-all BEFORE /{notif_id} — warna FastAPI "clear-all" ko ID samajhta hai
+@router.delete("/clear-all")
+def clear_all_notifications(
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db)
+):
+    db.query(Notification).filter(
+        Notification.user_id == current_user.id
+    ).delete()
+    db.commit()
+    return {"message": "All notifications cleared"}
+
+
 @router.put("/{notif_id}/read")
 def mark_read(
     notif_id: str,
@@ -70,17 +100,6 @@ def mark_read(
         db.commit()
     return {"message": "Marked as read"}
 
-@router.put("/read-all")
-def mark_all_read(
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
-    db.query(Notification).filter(
-        Notification.user_id == current_user.id,
-        Notification.is_read == False
-    ).update({"is_read": True})
-    db.commit()
-    return {"message": "All marked as read"}
 
 @router.delete("/{notif_id}")
 def delete_notification(
@@ -94,14 +113,3 @@ def delete_notification(
     ).delete()
     db.commit()
     return {"message": "Notification deleted"}
-
-@router.delete("/clear-all")
-def clear_all_notifications(
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
-    db.query(Notification).filter(
-        Notification.user_id == current_user.id
-    ).delete()
-    db.commit()
-    return {"message": "All notifications cleared"}

@@ -5,6 +5,7 @@ from app.database import Base
 import uuid
 from datetime import datetime
 
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
@@ -16,13 +17,22 @@ class Conversation(Base):
 
     messages = relationship("Message", back_populates="conversation")
 
+
 class Message(Base):
     __tablename__ = "messages"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"))
     sender_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
-    content = Column(Text, nullable=False)
+
+    # Text message
+    content = Column(Text, nullable=True)
+
+    # Media fields — image / video / audio
+    media_url = Column(String, nullable=True)       # Cloudinary URL
+    media_type = Column(String, nullable=True)      # 'image' | 'video' | 'audio'
+    media_thumbnail = Column(String, nullable=True) # Video thumbnail URL
+
     is_seen = Column(Boolean, default=False)
     seen_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

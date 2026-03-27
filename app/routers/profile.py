@@ -11,6 +11,7 @@ from app.schemas.profile import (
 )
 from app.utils.helpers import get_verified_user
 from app.core.config import settings
+from app.services.firebase import send_push_notification
 from datetime import datetime, date
 import os
 import uuid
@@ -18,7 +19,7 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/profile", tags=["Profile"])
 
-# ✅ Cloudinary setup
+# Cloudinary setup
 import cloudinary
 import cloudinary.uploader
 
@@ -29,11 +30,11 @@ cloudinary.config(
     secure=True
 )
 
+
 def calculate_age(dob: date) -> int:
     today = date.today()
-    return today.year - dob.year - (
-        (today.month, today.day) < (dob.month, dob.day)
-    )
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
 
 # ── GET MY PROFILE ────────────────────────────────────────────
 @router.get("/me")
@@ -41,19 +42,11 @@ def get_my_profile(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    profile = db.query(Profile).filter(
-        Profile.user_id == current_user.id
-    ).first()
-
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     if not profile:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Profile not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
 
-    age = None
-    if profile.date_of_birth:
-        age = calculate_age(profile.date_of_birth)
+    age = calculate_age(profile.date_of_birth) if profile.date_of_birth else None
 
     return {
         "id": str(profile.id),
@@ -98,13 +91,10 @@ def get_my_profile(
         "pref_family_status": profile.pref_family_status,
     }
 
+
 # ── STEP 1 ────────────────────────────────────────────────────
-@router.put("/step/1", response_model=dict)
-def save_step1(
-    data: ProfileStep1,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
+@router.put("/step/1")
+def save_step1(data: ProfileStep1, current_user: User = Depends(get_verified_user), db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.date_of_birth = data.date_of_birth
     profile.height_cm = data.height_cm
@@ -112,87 +102,71 @@ def save_step1(
     profile.marital_status = data.marital_status
     profile.caste = data.caste
     profile.mother_tongue = data.mother_tongue
-    if profile.setup_step < 1:
-        profile.setup_step = 1
+    if profile.setup_step < 1: profile.setup_step = 1
     profile.updated_at = datetime.utcnow()
     db.commit()
     return {"message": "Step 1 saved", "setup_step": profile.setup_step}
 
+
 # ── STEP 2 ────────────────────────────────────────────────────
-@router.put("/step/2", response_model=dict)
-def save_step2(
-    data: ProfileStep2,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
+@router.put("/step/2")
+def save_step2(data: ProfileStep2, current_user: User = Depends(get_verified_user), db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.house_ownership = data.house_ownership
     profile.house_size = data.house_size
     profile.country = data.country
     profile.city = data.city
-    if profile.setup_step < 2:
-        profile.setup_step = 2
+    if profile.setup_step < 2: profile.setup_step = 2
     profile.updated_at = datetime.utcnow()
     db.commit()
     return {"message": "Step 2 saved", "setup_step": profile.setup_step}
 
+
 # ── STEP 3 ────────────────────────────────────────────────────
-@router.put("/step/3", response_model=dict)
-def save_step3(
-    data: ProfileStep3,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
+@router.put("/step/3")
+def save_step3(data: ProfileStep3, current_user: User = Depends(get_verified_user), db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.sect = data.sect
     profile.family_status = data.family_status
     profile.family_values = data.family_values
     profile.siblings_count = data.siblings_count
-    if profile.setup_step < 3:
-        profile.setup_step = 3
+    if profile.setup_step < 3: profile.setup_step = 3
     profile.updated_at = datetime.utcnow()
     db.commit()
     return {"message": "Step 3 saved", "setup_step": profile.setup_step}
 
+
 # ── STEP 4 ────────────────────────────────────────────────────
-@router.put("/step/4", response_model=dict)
-def save_step4(
-    data: ProfileStep4,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
+@router.put("/step/4")
+def save_step4(data: ProfileStep4, current_user: User = Depends(get_verified_user), db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.education = data.education
     profile.institution_name = data.institution_name
     profile.profession = data.profession
     profile.employment_status = data.employment_status
     profile.annual_income = data.annual_income
-    if profile.setup_step < 4:
-        profile.setup_step = 4
+    if profile.setup_step < 4: profile.setup_step = 4
     profile.updated_at = datetime.utcnow()
     db.commit()
     return {"message": "Step 4 saved", "setup_step": profile.setup_step}
 
+
 # ── STEP 5 ────────────────────────────────────────────────────
-@router.put("/step/5", response_model=dict)
-def save_step5(
-    data: ProfileStep5,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
+@router.put("/step/5")
+def save_step5(data: ProfileStep5, current_user: User = Depends(get_verified_user), db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.dietary_preference = data.dietary_preference
     profile.exercise_habits = data.exercise_habits
     profile.smoking = data.smoking
     profile.living_style = data.living_style
-    if profile.setup_step < 5:
-        profile.setup_step = 5
+    if profile.setup_step < 5: profile.setup_step = 5
     profile.updated_at = datetime.utcnow()
     db.commit()
     return {"message": "Step 5 saved", "setup_step": profile.setup_step}
 
-# ── UPLOAD PHOTO — Cloudinary ─────────────────────────────────
-@router.post("/upload-photo", response_model=dict)
+
+# ── UPLOAD PHOTO ──────────────────────────────────────────────
+@router.post("/upload-photo")
 def upload_photo(
     file: UploadFile = File(...),
     current_user: User = Depends(get_verified_user),
@@ -200,15 +174,10 @@ def upload_photo(
 ):
     allowed = ["image/jpeg", "image/png", "image/jpg", "image/webp"]
     if file.content_type not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only JPEG and PNG images allowed"
-        )
+        raise HTTPException(status_code=400, detail="Only JPEG and PNG images allowed")
 
     try:
-        # ✅ Cloudinary pe upload karo
         contents = file.file.read()
-
         result = cloudinary.uploader.upload(
             contents,
             folder="robina_profiles",
@@ -220,34 +189,18 @@ def upload_photo(
                 {"fetch_format": "auto"}
             ]
         )
-
         photo_url = result["secure_url"]
-
-        # ✅ Database update karo
-        profile = db.query(Profile).filter(
-            Profile.user_id == current_user.id
-        ).first()
+        profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
         profile.profile_photo = photo_url
         db.commit()
-
-        return {
-            "message": "Photo uploaded successfully",
-            "photo_url": photo_url
-        }
-
+        return {"message": "Photo uploaded successfully", "photo_url": photo_url}
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Upload failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
 
 # ── STEP 6 ────────────────────────────────────────────────────
-@router.put("/step/6", response_model=dict)
-def save_step6(
-    data: ProfileStep6,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
+@router.put("/step/6")
+def save_step6(data: ProfileStep6, current_user: User = Depends(get_verified_user), db: Session = Depends(get_db)):
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     profile.pref_age_min = data.pref_age_min
     profile.pref_age_max = data.pref_age_max
@@ -258,30 +211,23 @@ def save_step6(
     profile.pref_family_status = data.pref_family_status
     profile.setup_step = 6
     profile.updated_at = datetime.utcnow()
-
     user = db.query(User).filter(User.id == current_user.id).first()
     user.profile_complete = True
     db.commit()
+    return {"message": "Profile completed successfully", "setup_step": 6, "profile_complete": True}
 
-    return {
-        "message": "Profile completed successfully",
-        "setup_step": 6,
-        "profile_complete": True
-    }
 
 # ── UPDATE NAME ───────────────────────────────────────────────
 class UpdateBasicRequest(BaseModel):
     full_name: str
 
-@router.put("/update-basic", response_model=dict)
-def update_basic(
-    data: UpdateBasicRequest,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
+
+@router.put("/update-basic")
+def update_basic(data: UpdateBasicRequest, current_user: User = Depends(get_verified_user), db: Session = Depends(get_db)):
     current_user.full_name = data.full_name
     db.commit()
     return {"message": "Profile updated successfully"}
+
 
 # ── VIEW PROFILE ──────────────────────────────────────────────
 @router.get("/{user_id}")
@@ -321,9 +267,20 @@ def get_profile(
             db.add(notif)
             db.commit()
 
-    age = None
-    if profile and profile.date_of_birth:
-        age = calculate_age(profile.date_of_birth)
+            # FCM Push for profile view
+            if user.fcm_token:
+                send_push_notification(
+                    fcm_token=user.fcm_token,
+                    title="👁️ Profile Viewed",
+                    body=f"{current_user.full_name} viewed your profile",
+                    data={
+                        "type": "profile_view",
+                        "viewer_id": str(current_user.id),
+                        "viewer_name": current_user.full_name
+                    }
+                )
+
+    age = calculate_age(profile.date_of_birth) if profile and profile.date_of_birth else None
 
     return {
         "id": str(user.id),

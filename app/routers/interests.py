@@ -7,9 +7,11 @@ from app.models.interest import Interest, InterestStatus
 from app.models.notification import Notification, NotifType
 from app.schemas.interest import SendInterestRequest, InterestActionRequest
 from app.utils.helpers import get_verified_user
+from app.services.firebase import send_push_notification
 from datetime import datetime
 
 router = APIRouter(prefix="/interests", tags=["Interests"])
+
 
 # ── SEND INTEREST ─────────────────────────────────────────────
 @router.post("/send")
@@ -19,10 +21,7 @@ def send_interest(
     db: Session = Depends(get_db)
 ):
     if str(current_user.id) == request.receiver_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot send interest to yourself"
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot send interest to yourself")
 
     existing = db.query(Interest).filter(
         Interest.sender_id == current_user.id,
@@ -31,15 +30,9 @@ def send_interest(
     ).first()
 
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Interest already sent"
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Interest already sent")
 
-    interest = Interest(
-        sender_id=current_user.id,
-        receiver_id=request.receiver_id
-    )
+    interest = Interest(sender_id=current_user.id, receiver_id=request.receiver_id)
     db.add(interest)
 
     notif = Notification(
@@ -50,7 +43,22 @@ def send_interest(
     db.add(notif)
     db.commit()
 
+    # FCM Push
+    receiver = db.query(User).filter(User.id == request.receiver_id).first()
+    if receiver and receiver.fcm_token:
+        send_push_notification(
+            fcm_token=receiver.fcm_token,
+            title="💚 New Interest",
+            body=f"{current_user.full_name} sent you an interest",
+            data={
+                "type": "interest",
+                "sender_id": str(current_user.id),
+                "sender_name": current_user.full_name
+            }
+        )
+
     return {"message": "Interest sent successfully"}
+
 
 # ── RESPOND TO INTEREST ───────────────────────────────────────
 @router.put("/respond")
@@ -65,24 +73,20 @@ def respond_interest(
     ).first()
 
     if not interest:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Interest not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interest not found")
 
     if request.action == "accept":
         interest.status = InterestStatus.accepted
         notif_msg = f"{current_user.full_name} accepted your interest"
         notif_type = NotifType.accepted
+        push_title = "✅ Interest Accepted"
     elif request.action == "decline":
         interest.status = InterestStatus.declined
         notif_msg = f"{current_user.full_name} declined your interest"
         notif_type = NotifType.interest
+        push_title = "Interest Update"
     else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Action must be accept or decline"
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Action must be accept or decline")
 
     interest.updated_at = datetime.utcnow()
 
@@ -94,7 +98,23 @@ def respond_interest(
     db.add(notif)
     db.commit()
 
+    # FCM Push — sirf accept pe notify karo
+    if request.action == "accept":
+        sender = db.query(User).filter(User.id == interest.sender_id).first()
+        if sender and sender.fcm_token:
+            send_push_notification(
+                fcm_token=sender.fcm_token,
+                title=push_title,
+                body=notif_msg,
+                data={
+                    "type": "interest_accepted",
+                    "sender_id": str(current_user.id),
+                    "sender_name": current_user.full_name
+                }
+            )
+
     return {"message": f"Interest {request.action}ed successfully"}
+
 
 # ── GET RECEIVED ──────────────────────────────────────────────
 @router.get("/received")
@@ -110,8 +130,8 @@ def get_received(
         Interest.receiver_id == current_user.id,
         Interest.status == InterestStatus.pending
     ).all()
-
     return [_format_interest(i, u, p) for i, u, p in interests]
+
 
 # ── GET SENT ──────────────────────────────────────────────────
 @router.get("/sent")
@@ -126,8 +146,8 @@ def get_sent(
     ).filter(
         Interest.sender_id == current_user.id
     ).all()
-
     return [_format_interest(i, u, p) for i, u, p in interests]
+
 
 # ── GET ACCEPTED ──────────────────────────────────────────────
 @router.get("/accepted")
@@ -143,8 +163,8 @@ def get_accepted(
         Interest.receiver_id == current_user.id,
         Interest.status == InterestStatus.accepted
     ).all()
-
     return [_format_interest(i, u, p) for i, u, p in interests]
+
 
 # ── GET CANCELLED ─────────────────────────────────────────────
 @router.get("/cancelled")
@@ -160,8 +180,8 @@ def get_cancelled(
         Interest.receiver_id == current_user.id,
         Interest.status == InterestStatus.declined
     ).all()
-
     return [_format_interest(i, u, p) for i, u, p in interests]
+
 
 def _format_interest(interest, user, profile):
     from datetime import date
@@ -169,9 +189,7 @@ def _format_interest(interest, user, profile):
     if profile and profile.date_of_birth:
         today = date.today()
         dob = profile.date_of_birth
-        age = today.year - dob.year - (
-            (today.month, today.day) < (dob.month, dob.day)
-        )
+        age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
     return {
         "id": str(interest.id),
         "sender_id": str(interest.sender_id),
