@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, desc
 from app.database import get_db
 from app.models.user import User
-from app.models.call import CallLog, CallStatus, CallType
+from app.models.call_log import CallLog, CallStatus, CallType
 from app.models.profile import Profile
 from app.utils.helpers import get_verified_user
 from app.core.config import settings

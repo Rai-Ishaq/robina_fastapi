@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, desc
 from app.database import get_db
 from app.models.user import User
-from app.models.chat import Conversation, Message, MessageStatus
+from app.models.message import Conversation, Message
 from app.utils.helpers import get_verified_user, get_current_user
 from app.core.security import decode_token
 from app.services.firebase import send_push_notification
