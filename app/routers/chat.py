@@ -165,6 +165,25 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                             {"type": "message_seen", "message_id": message_id}
                         )
 
+            elif msg_type == "messages_seen":
+                conv_id = message_data.get("conversation_id")
+                if conv_id:
+                    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
+                    if conv:
+                        db.query(Message).filter(
+                            Message.conversation_id == conv_id,
+                            Message.sender_id != user_id,
+                            Message.is_seen == False
+                        ).update({"is_seen": True, "seen_at": datetime.utcnow()})
+                        db.commit()
+
+                        other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
+                        await manager.send_to_user(other_id, {
+                            "type": "messages_seen",
+                            "user_id": user_id,
+                            "conversation_id": conv_id
+                        })
+
             elif msg_type in ["typing", "stop_typing", "recording", "stop_recording"]:
                 conv_id = message_data.get("conversation_id")
                 if conv_id:
