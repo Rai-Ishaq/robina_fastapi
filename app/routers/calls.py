@@ -105,17 +105,15 @@ async def initiate_call(
     except Exception as e:
         logger.error(f"WebSocket notify error: {e}")
 
-    # ✅ FCM Push Notification — agar receiver offline hai
+    # ✅ FCM Push Notification — data-only taake CallKit UI properly show ho
     try:
-        from app.services.firebase import send_push_notification
+        from app.services.firebase import send_call_notification
         receiver = db.query(User).filter(
             User.id == uuid_lib.UUID(receiver_id)
         ).first()
         if receiver and receiver.fcm_token:
-            send_push_notification(
+            send_call_notification(
                 fcm_token=receiver.fcm_token,
-                title=f"📞 Incoming {call_type.capitalize()} Call",
-                body=f"{current_user.full_name} is calling you",
                 data={
                     "type": "call",
                     "call_type": call_type,
