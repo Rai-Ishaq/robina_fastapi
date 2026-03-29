@@ -1,9 +1,16 @@
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Text
+import enum
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Text, Enum
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.database import Base
 import uuid
 from datetime import datetime
+
+
+class MessageStatus(enum.Enum):
+    sent = "sent"
+    delivered = "delivered"
+    seen = "seen"
 
 
 class Conversation(Base):
@@ -33,8 +40,11 @@ class Message(Base):
     media_type = Column(String, nullable=True)      # 'image' | 'video' | 'audio'
     media_thumbnail = Column(String, nullable=True) # Video thumbnail URL
 
-    is_seen = Column(Boolean, default=False)
-    seen_at = Column(DateTime, nullable=True)
+    # Quote fields
+    quote_content = Column(Text, nullable=True)
+    quote_sender = Column(String, nullable=True)
+
+    status = Column(Enum(MessageStatus, native_enum=False, length=50), default=MessageStatus.sent)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     conversation = relationship("Conversation", back_populates="messages")
