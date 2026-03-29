@@ -1,625 +1,543 @@
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status, UploadFile, File, Form
-from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
-from app.database import get_db, SessionLocal
-from app.models.user import User
-from app.models.message import Conversation, Message
-from app.models.notification import Notification, NotifType
-from app.models.profile import Profile
-from app.schemas.message import SendMessageRequest
-from app.utils.helpers import get_verified_user
-from app.core.security import decode_token
-from app.services.firebase import send_push_notification
-from datetime import datetime
-from typing import Dict, List
 import json
-import os
 import cloudinary
 import cloudinary.uploader
+import os
+from typing import Dict
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
+from sqlalchemy.orm import Session
+from sqlalchemy import or_, and_, desc
+from app.database import get_db
+from app.models.user import User
+from app.models.chat import Conversation, Message, MessageStatus
+from app.utils.helpers import get_verified_user, get_current_user
+from app.core.security import decode_token
+from app.services.firebase import send_push_notification
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
-# Cloudinary config
 cloudinary.config(
     cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", ""),
     api_key=os.environ.get("CLOUDINARY_API_KEY", ""),
     api_secret=os.environ.get("CLOUDINARY_API_SECRET", ""),
-    secure=True
 )
 
-# ── WEBSOCKET MANAGER ─────────────────────────────────────────
+
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
+        self.connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, user_id: str, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections[user_id] = websocket
+    async def connect(self, user_id: str, ws: WebSocket):
+        await ws.accept()
+        self.connections[user_id] = ws
 
     def disconnect(self, user_id: str):
-        if user_id in self.active_connections:
-            del self.active_connections[user_id]
-
-    async def send_to_user(self, user_id: str, data: dict):
-        if user_id in self.active_connections:
-            try:
-                await self.active_connections[user_id].send_text(json.dumps(data))
-            except Exception:
-                self.disconnect(user_id)
+        self.connections.pop(user_id, None)
 
     def is_online(self, user_id: str) -> bool:
-        return user_id in self.active_connections
+        return user_id in self.connections
+
+    async def send_to(self, user_id: str, data: dict):
+        ws = self.connections.get(user_id)
+        if ws:
+            try:
+                await ws.send_text(json.dumps(data))
+            except Exception:
+                self.connections.pop(user_id, None)
 
 
 manager = ConnectionManager()
 
 
-# ── WEBSOCKET ENDPOINT ────────────────────────────────────────
-@router.websocket("/ws/{token}")
-async def websocket_endpoint(websocket: WebSocket, token: str):
+@router.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session = Depends(get_db)):
     payload = decode_token(token)
     if not payload:
-        await websocket.close(code=4001)
+        await ws.close(code=4001)
         return
 
     user_id = payload.get("sub")
     if not user_id:
-        await websocket.close(code=4001)
+        await ws.close(code=4001)
         return
 
-    await manager.connect(user_id, websocket)
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        await ws.close(code=4001)
+        return
 
-    db = SessionLocal()
+    await manager.connect(str(user_id), ws)
+
+    user.is_online = True
+    user.last_seen = None
+    db.commit()
+
+    conversations = db.query(Conversation).filter(
+        or_(Conversation.user1_id == user_id, Conversation.user2_id == user_id)
+    ).all()
+
+    for conv in conversations:
+        other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
+        await manager.send_to(other_id, {
+            "type": "user_online",
+            "user_id": str(user_id),
+        })
+
     try:
-        user = db.query(User).filter(User.id == user_id).first()
-        if user:
-            user.last_seen = datetime.utcnow()
-            db.commit()
-
-            # Broadcast online status
-            convs = db.query(Conversation).filter(
-                or_(Conversation.user1_id == user_id, Conversation.user2_id == user_id)
-            ).all()
-            for conv in convs:
-                other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                if manager.is_online(other_id):
-                    import asyncio
-                    asyncio.create_task(manager.send_to_user(other_id, {
-                        "type": "user_online",
-                        "user_id": user_id,
-                        "last_seen": str(user.last_seen)
-                    }))
-
-        await websocket.send_text(json.dumps({
-            "type": "connected",
-            "message": "Connected successfully"
-        }))
-
         while True:
-            data = await websocket.receive_text()
-            message_data = json.loads(data)
-            msg_type = message_data.get("type")
+            text = await ws.receive_text()
+            try:
+                msg = json.loads(text)
+            except Exception:
+                continue
 
-            if msg_type == "send_message":
-                receiver_id = message_data.get("receiver_id")
-                content = message_data.get("content", "").strip()
+            mtype = msg.get("type", "")
+
+            if mtype == "ping":
+                await manager.send_to(str(user_id), {"type": "pong"})
+
+            elif mtype == "send_message":
+                receiver_id = msg.get("receiver_id", "")
+                content = msg.get("content", "").strip()
+                conv_id = msg.get("conversation_id", "")
+
                 if not content or not receiver_id:
                     continue
 
-                conversation = _get_or_create_conversation(db, user_id, receiver_id)
-                sender = db.query(User).filter(User.id == user_id).first()
-
-                msg = Message(
-                    conversation_id=conversation.id,
-                    sender_id=user_id,
-                    content=content
-                )
-                db.add(msg)
-                conversation.updated_at = datetime.utcnow()
-
-                # DB Notification
-                notif = Notification(
-                    user_id=receiver_id,
-                    type=NotifType.message,
-                    message=f"{sender.full_name}: {content[:50]}"
-                )
-                db.add(notif)
-                db.commit()
-
-                # FCM Push — sirf agar offline ho
                 receiver = db.query(User).filter(User.id == receiver_id).first()
-                if receiver and receiver.fcm_token and not manager.is_online(receiver_id):
+                if not receiver:
+                    continue
+
+                conv = None
+                if conv_id:
+                    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
+
+                if not conv:
+                    conv = db.query(Conversation).filter(
+                        or_(
+                            and_(Conversation.user1_id == user_id, Conversation.user2_id == receiver_id),
+                            and_(Conversation.user1_id == receiver_id, Conversation.user2_id == user_id),
+                        )
+                    ).first()
+
+                if not conv:
+                    from uuid import uuid4
+                    conv = Conversation(id=uuid4(), user1_id=user_id, user2_id=receiver_id)
+                    db.add(conv)
+                    db.flush()
+
+                status = MessageStatus.seen if manager.is_online(receiver_id) else MessageStatus.sent
+                new_msg = Message(
+                    conversation_id=conv.id,
+                    sender_id=user_id,
+                    content=content,
+                    status=status,
+                    quote_content=msg.get("quote_content"),
+                    quote_sender=msg.get("quote_sender"),
+                )
+                db.add(new_msg)
+                db.commit()
+                db.refresh(new_msg)
+
+                payload_out = {
+                    "type": "new_message",
+                    "id": str(new_msg.id),
+                    "conversation_id": str(conv.id),
+                    "sender_id": str(user_id),
+                    "receiver_id": str(receiver_id),
+                    "content": content,
+                    "created_at": new_msg.created_at.isoformat(),
+                    "status": new_msg.status.value,
+                    "quote_content": msg.get("quote_content"),
+                    "quote_sender": msg.get("quote_sender"),
+                }
+
+                await manager.send_to(str(user_id), payload_out)
+                await manager.send_to(str(receiver_id), payload_out)
+
+                if not manager.is_online(str(receiver_id)) and receiver.fcm_token:
                     send_push_notification(
                         fcm_token=receiver.fcm_token,
-                        title=sender.full_name,
+                        title=user.full_name or "New Message",
                         body=content[:100],
                         data={
-                            "type": "message",
-                            "sender_id": user_id,
-                            "conversation_id": str(conversation.id)
+                            "type": "chat_message",
+                            "sender_id": str(user_id),
+                            "conversation_id": str(conv.id),
                         }
                     )
 
-                msg_payload = {
-                    "type": "new_message",
-                    "id": str(msg.id),
-                    "conversation_id": str(conversation.id),
-                    "sender_id": user_id,
-                    "content": content,
-                    "is_seen": False,
-                    "created_at": str(msg.created_at)
-                }
-                await manager.send_to_user(receiver_id, msg_payload)
-                # Sender already adds via REST internally, DO NOT broadcast back to sender to prevent duplicates
+            elif mtype == "messages_seen":
+                conv_id = msg.get("conversation_id", "")
+                if not conv_id:
+                    continue
 
-            elif msg_type == "seen":
-                message_id = message_data.get("message_id")
-                if message_id:
-                    msg = db.query(Message).filter(Message.id == message_id).first()
-                    if msg and str(msg.sender_id) != user_id:
-                        msg.is_seen = True
-                        msg.seen_at = datetime.utcnow()
+                msgs_to_update = db.query(Message).filter(
+                    Message.conversation_id == conv_id,
+                    Message.sender_id != user_id,
+                    Message.status != MessageStatus.seen,
+                ).all()
+
+                for m in msgs_to_update:
+                    m.status = MessageStatus.seen
+                db.commit()
+
+                conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
+                if conv:
+                    other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
+                    await manager.send_to(other_id, {
+                        "type": "messages_seen",
+                        "conversation_id": conv_id,
+                        "seen_by": str(user_id),
+                    })
+
+            elif mtype in ("typing", "stop_typing", "recording", "stop_recording"):
+                conv_id = msg.get("conversation_id", "")
+                conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
+                if conv:
+                    other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
+                    await manager.send_to(other_id, {
+                        "type": mtype,
+                        "conversation_id": conv_id,
+                        "user_id": str(user_id),
+                    })
+
+            elif mtype == "delete_message":
+                message_id = msg.get("message_id", "")
+                for_everyone = msg.get("for_everyone", False)
+                db_msg = db.query(Message).filter(
+                    Message.id == message_id,
+                    Message.sender_id == user_id,
+                ).first()
+                if db_msg:
+                    if for_everyone:
+                        db_msg.content = "__deleted__"
                         db.commit()
-                        await manager.send_to_user(
-                            str(msg.sender_id),
-                            {"type": "message_seen", "message_id": message_id}
-                        )
-
-            elif msg_type == "messages_seen":
-                conv_id = message_data.get("conversation_id")
-                if conv_id:
-                    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
-                    if conv:
-                        db.query(Message).filter(
-                            Message.conversation_id == conv_id,
-                            Message.sender_id != user_id,
-                            Message.is_seen == False
-                        ).update({"is_seen": True, "seen_at": datetime.utcnow()})
-                        db.commit()
-
-                        other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                        await manager.send_to_user(other_id, {
-                            "type": "messages_seen",
-                            "user_id": user_id,
-                            "conversation_id": conv_id
-                        })
-
-            elif msg_type in ["typing", "stop_typing", "recording", "stop_recording"]:
-                conv_id = message_data.get("conversation_id")
-                if conv_id:
-                    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
-                    if conv:
-                        other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                        payload = {
-                            "type": msg_type,
-                            "user_id": user_id,
-                            "conversation_id": conv_id
-                        }
-                        if msg_type == "typing":
-                            payload["is_typing"] = message_data.get("is_typing", True)
-                        
-                        await manager.send_to_user(other_id, payload)
-
-            elif msg_type == "join_conversation":
-                conv_id = message_data.get("conversation_id")
-                if conv_id:
-                    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
-                    if conv:
-                        other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                        await manager.send_to_user(other_id, {
-                            "type": "user_in_chat",
-                            "user_id": user_id,
-                            "conversation_id": conv_id
-                        })
-
-            elif msg_type == "leave_conversation":
-                conv_id = message_data.get("conversation_id")
-                if conv_id:
-                    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
-                    if conv:
-                        other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                        await manager.send_to_user(other_id, {
-                            "type": "user_left_chat",
-                            "user_id": user_id
-                        })
-
-            elif msg_type == "delete_message":
-                message_id = message_data.get("message_id")
-                for_everyone = message_data.get("for_everyone", False)
-                if message_id:
-                    msg = db.query(Message).filter(Message.id == message_id).first()
-                    if msg and str(msg.sender_id) == user_id:
-                        conv = db.query(Conversation).filter(Conversation.id == msg.conversation_id).first()
-                        other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                        if for_everyone:
-                            msg.content = "__deleted__"
-                            msg.media_url = None
-                            db.commit()
-                            await manager.send_to_user(other_id, {
+                        conv = db.query(Conversation).filter(Conversation.id == db_msg.conversation_id).first()
+                        if conv:
+                            other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
+                            await manager.send_to(other_id, {
                                 "type": "message_deleted",
                                 "message_id": message_id,
-                                "for_everyone": True
+                                "for_everyone": True,
                             })
-                        else:
-                            db.delete(msg)
-                            db.commit()
-
-            elif msg_type == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
+                    else:
+                        db.delete(db_msg)
+                        db.commit()
 
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
-        db_update = SessionLocal()
-        try:
-            u = db_update.query(User).filter(User.id == user_id).first()
-            if u:
-                u.last_seen = datetime.utcnow()
-                db_update.commit()
-                
-                # Broadcast offline status
-                convs = db_update.query(Conversation).filter(
-                    or_(Conversation.user1_id == user_id, Conversation.user2_id == user_id)
-                ).all()
-                for conv in convs:
-                    other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                    if manager.is_online(other_id):
-                        import asyncio
-                        asyncio.create_task(manager.send_to_user(other_id, {
-                            "type": "user_offline",
-                            "user_id": user_id,
-                            "last_seen": str(u.last_seen)
-                        }))
-        finally:
-            db_update.close()
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-        manager.disconnect(user_id)
+        pass
     finally:
-        db.close()
+        manager.disconnect(str(user_id))
+        from datetime import datetime
+        user.is_online = False
+        user.last_seen = datetime.utcnow()
+        db.commit()
+
+        for conv in conversations:
+            other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
+            await manager.send_to(other_id, {
+                "type": "user_offline",
+                "user_id": str(user_id),
+                "last_seen": user.last_seen.isoformat(),
+            })
 
 
-# ── HELPER: Get or create conversation ───────────────────────
-def _get_or_create_conversation(db, user1_id: str, user2_id: str) -> Conversation:
-    conversation = db.query(Conversation).filter(
-        or_(
-            and_(Conversation.user1_id == user1_id, Conversation.user2_id == user2_id),
-            and_(Conversation.user1_id == user2_id, Conversation.user2_id == user1_id)
-        )
-    ).first()
-    if not conversation:
-        conversation = Conversation(user1_id=user1_id, user2_id=user2_id)
-        db.add(conversation)
-        db.flush()
-    return conversation
-
-
-# ── GET CONVERSATIONS ─────────────────────────────────────────
 @router.get("/conversations")
-def get_conversations(
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
-    conversations = db.query(Conversation).filter(
-        or_(
-            Conversation.user1_id == current_user.id,
-            Conversation.user2_id == current_user.id
-        )
-    ).order_by(Conversation.updated_at.desc()).all()
+def get_conversations(current_user: User = Depends(get_verified_user), db: Session = Depends(get_db)):
+    convs = db.query(Conversation).filter(
+        or_(Conversation.user1_id == current_user.id, Conversation.user2_id == current_user.id)
+    ).order_by(desc(Conversation.updated_at)).all()
 
     result = []
-    for conv in conversations:
-        other_id = (
-            conv.user2_id
-            if str(conv.user1_id) == str(current_user.id)
-            else conv.user1_id
-        )
-        other_user = db.query(User).filter(User.id == other_id).first()
-        if not other_user:
+    for conv in convs:
+        other_id = conv.user2_id if str(conv.user1_id) == str(current_user.id) else conv.user1_id
+        other = db.query(User).filter(User.id == other_id).first()
+        if not other:
             continue
 
-        other_profile = db.query(Profile).filter(Profile.user_id == other_id).first()
         last_msg = db.query(Message).filter(
             Message.conversation_id == conv.id
-        ).order_by(Message.created_at.desc()).first()
+        ).order_by(desc(Message.created_at)).first()
 
         unread_count = db.query(Message).filter(
             Message.conversation_id == conv.id,
-            Message.sender_id == other_id,
-            Message.is_seen == False
+            Message.sender_id != current_user.id,
+            Message.status != MessageStatus.seen,
         ).count()
 
-        # Last message display text
-        last_msg_text = None
-        if last_msg:
-            if last_msg.content and last_msg.content != "__deleted__":
-                last_msg_text = last_msg.content
-            elif last_msg.media_type == 'image':
-                last_msg_text = '📷 Image'
-            elif last_msg.media_type == 'video':
-                last_msg_text = '🎥 Video'
-            elif last_msg.media_type == 'audio':
-                last_msg_text = '🎤 Voice message'
-            elif last_msg.content == "__deleted__":
-                last_msg_text = 'Message deleted'
+        from app.models.profile import Profile
+        profile = db.query(Profile).filter(Profile.user_id == other_id).first()
+        photo = profile.profile_photo if profile else None
 
         result.append({
             "id": str(conv.id),
             "other_user_id": str(other_id),
-            "other_user_name": other_user.full_name,
-            "other_user_photo": other_profile.profile_photo if other_profile else None,
+            "other_user_name": other.full_name or "User",
+            "other_user_photo": photo,
+            "last_message": last_msg.content if last_msg else "",
+            "last_message_time": last_msg.created_at.isoformat() if last_msg else conv.created_at.isoformat(),
+            "unread_count": unread_count,
             "is_online": manager.is_online(str(other_id)),
-            "last_seen": str(other_user.last_seen),
-            "last_message": last_msg_text,
-            "last_message_time": str(last_msg.created_at) if last_msg else None,
-            "unread_count": unread_count
+            "last_seen": other.last_seen.isoformat() if other.last_seen else None,
+            "updated_at": conv.updated_at.isoformat() if conv.updated_at else conv.created_at.isoformat(),
         })
-
     return result
 
 
-# ── GET MESSAGES ──────────────────────────────────────────────
 @router.get("/messages/{conversation_id}")
 def get_messages(
     conversation_id: str,
-    page: int = 1,
-    limit: int = 50,
     current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    conversation = db.query(Conversation).filter(
-        Conversation.id == conversation_id,
-        or_(
-            Conversation.user1_id == current_user.id,
-            Conversation.user2_id == current_user.id
-        )
-    ).first()
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if not conv:
+        return []
 
-    if not conversation:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    if str(conv.user1_id) != str(current_user.id) and str(conv.user2_id) != str(current_user.id):
+        return []
 
-    messages = db.query(Message).filter(
+    msgs = db.query(Message).filter(
         Message.conversation_id == conversation_id
-    ).order_by(Message.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
-
-    # Mark as seen
-    db.query(Message).filter(
-        Message.conversation_id == conversation_id,
-        Message.sender_id != current_user.id,
-        Message.is_seen == False
-    ).update({"is_seen": True, "seen_at": datetime.utcnow()})
-    db.commit()
+    ).order_by(Message.created_at).all()
 
     return [
         {
             "id": str(m.id),
             "conversation_id": str(m.conversation_id),
             "sender_id": str(m.sender_id),
-            "content": m.content,
+            "content": m.content or "",
             "media_url": m.media_url,
             "media_type": m.media_type,
             "media_thumbnail": m.media_thumbnail,
-            "is_seen": m.is_seen,
-            "seen_at": str(m.seen_at) if m.seen_at else None,
-            "created_at": str(m.created_at)
+            "status": m.status.value if m.status else "sent",
+            "is_seen": m.status == MessageStatus.seen,
+            "is_delivered": m.status in (MessageStatus.delivered, MessageStatus.seen),
+            "created_at": m.created_at.isoformat(),
+            "quote_content": m.quote_content,
+            "quote_sender": m.quote_sender,
         }
-        for m in reversed(messages)
+        for m in msgs
     ]
 
 
-# ── DELETE CONVERSATION ───────────────────────────────────────
+@router.post("/send")
+def send_message_rest(
+    body: dict,
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    receiver_id = body.get("receiver_id", "")
+    content = (body.get("content") or "").strip()
+    conv_id = body.get("conversation_id", "")
+
+    if not content or not receiver_id:
+        return {"success": False, "error": "Missing fields"}
+
+    receiver = db.query(User).filter(User.id == receiver_id).first()
+    if not receiver:
+        return {"success": False, "error": "Receiver not found"}
+
+    conv = None
+    if conv_id:
+        conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
+
+    if not conv:
+        conv = db.query(Conversation).filter(
+            or_(
+                and_(Conversation.user1_id == current_user.id, Conversation.user2_id == receiver_id),
+                and_(Conversation.user1_id == receiver_id, Conversation.user2_id == current_user.id),
+            )
+        ).first()
+
+    if not conv:
+        from uuid import uuid4
+        conv = Conversation(id=uuid4(), user1_id=current_user.id, user2_id=receiver_id)
+        db.add(conv)
+        db.flush()
+
+    status = MessageStatus.seen if manager.is_online(str(receiver_id)) else MessageStatus.sent
+    new_msg = Message(
+        conversation_id=conv.id,
+        sender_id=current_user.id,
+        content=content,
+        status=status,
+        quote_content=body.get("quote_content"),
+        quote_sender=body.get("quote_sender"),
+    )
+    db.add(new_msg)
+    db.commit()
+    db.refresh(new_msg)
+
+    payload_out = {
+        "type": "new_message",
+        "id": str(new_msg.id),
+        "conversation_id": str(conv.id),
+        "sender_id": str(current_user.id),
+        "receiver_id": str(receiver_id),
+        "content": content,
+        "created_at": new_msg.created_at.isoformat(),
+        "status": new_msg.status.value,
+        "quote_content": body.get("quote_content"),
+        "quote_sender": body.get("quote_sender"),
+    }
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(manager.send_to(str(receiver_id), payload_out))
+        loop.create_task(manager.send_to(str(current_user.id), payload_out))
+    except Exception:
+        pass
+
+    if not manager.is_online(str(receiver_id)) and receiver.fcm_token:
+        send_push_notification(
+            fcm_token=receiver.fcm_token,
+            title=current_user.full_name or "New Message",
+            body=content[:100],
+            data={
+                "type": "chat_message",
+                "sender_id": str(current_user.id),
+                "conversation_id": str(conv.id),
+            }
+        )
+
+    return {
+        "success": True,
+        "data": {
+            "id": str(new_msg.id),
+            "conversation_id": str(conv.id),
+            "content": content,
+            "created_at": new_msg.created_at.isoformat(),
+            "status": new_msg.status.value,
+        }
+    }
+
+
+@router.post("/send-media")
+async def send_media(
+    receiver_id: str = Form(...),
+    media_type: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        contents = await file.read()
+        resource_type = "video" if media_type in ("video", "audio") else "image"
+        upload_result = cloudinary.uploader.upload(
+            contents,
+            resource_type=resource_type,
+            folder="robina_chat",
+        )
+        media_url = upload_result.get("secure_url", "")
+        thumbnail = None
+        if media_type == "video":
+            thumbnail = upload_result.get("url", "").replace("/upload/", "/upload/w_200,h_200,c_fill/")
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    receiver = db.query(User).filter(User.id == receiver_id).first()
+    if not receiver:
+        return {"success": False, "error": "Receiver not found"}
+
+    conv = db.query(Conversation).filter(
+        or_(
+            and_(Conversation.user1_id == current_user.id, Conversation.user2_id == receiver_id),
+            and_(Conversation.user1_id == receiver_id, Conversation.user2_id == current_user.id),
+        )
+    ).first()
+
+    if not conv:
+        from uuid import uuid4
+        conv = Conversation(id=uuid4(), user1_id=current_user.id, user2_id=receiver_id)
+        db.add(conv)
+        db.flush()
+
+    content_text = {"image": "📷 Photo", "video": "🎥 Video", "audio": "🎤 Voice"}.get(media_type, "📎 File")
+    status = MessageStatus.seen if manager.is_online(str(receiver_id)) else MessageStatus.sent
+
+    new_msg = Message(
+        conversation_id=conv.id,
+        sender_id=current_user.id,
+        content=content_text,
+        media_url=media_url,
+        media_type=media_type,
+        media_thumbnail=thumbnail,
+        status=status,
+    )
+    db.add(new_msg)
+    db.commit()
+    db.refresh(new_msg)
+
+    payload_out = {
+        "type": "new_message",
+        "id": str(new_msg.id),
+        "conversation_id": str(conv.id),
+        "sender_id": str(current_user.id),
+        "receiver_id": str(receiver_id),
+        "content": content_text,
+        "media_url": media_url,
+        "media_type": media_type,
+        "media_thumbnail": thumbnail,
+        "created_at": new_msg.created_at.isoformat(),
+        "status": new_msg.status.value,
+    }
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(manager.send_to(str(receiver_id), payload_out))
+        loop.create_task(manager.send_to(str(current_user.id), payload_out))
+    except Exception:
+        pass
+
+    if not manager.is_online(str(receiver_id)) and receiver.fcm_token:
+        send_push_notification(
+            fcm_token=receiver.fcm_token,
+            title=current_user.full_name or "Message",
+            body=content_text,
+            data={"type": "chat_message", "sender_id": str(current_user.id), "conversation_id": str(conv.id)},
+        )
+
+    return {
+        "success": True,
+        "data": {
+            "id": str(new_msg.id),
+            "conversation_id": str(conv.id),
+            "media_url": media_url,
+            "media_type": media_type,
+            "media_thumbnail": thumbnail,
+            "content": content_text,
+            "created_at": new_msg.created_at.isoformat(),
+        }
+    }
+
+
 @router.delete("/conversations/{conversation_id}")
 def delete_conversation(
     conversation_id: str,
     current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    conversation = db.query(Conversation).filter(
-        Conversation.id == conversation_id,
-        or_(
-            Conversation.user1_id == current_user.id,
-            Conversation.user2_id == current_user.id
-        )
-    ).first()
-
-    if not conversation:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
-    db.query(Message).filter(Message.conversation_id == conversation_id).delete()
-    db.delete(conversation)
-    db.commit()
-    return {"message": "Conversation deleted"}
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if conv and (str(conv.user1_id) == str(current_user.id) or str(conv.user2_id) == str(current_user.id)):
+        db.query(Message).filter(Message.conversation_id == conversation_id).delete()
+        db.delete(conv)
+        db.commit()
+    return {"success": True}
 
 
-# ── SEND MESSAGE REST fallback ────────────────────────────────
-@router.post("/send")
-def send_message(
-    request: SendMessageRequest,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
-    conversation = _get_or_create_conversation(db, str(current_user.id), request.receiver_id)
-
-    msg = Message(
-        conversation_id=conversation.id,
-        sender_id=current_user.id,
-        content=request.content
-    )
-    db.add(msg)
-    conversation.updated_at = datetime.utcnow()
-
-    notif = Notification(
-        user_id=request.receiver_id,
-        type=NotifType.message,
-        message=f"{current_user.full_name}: {request.content[:50]}"
-    )
-    db.add(notif)
-    db.commit()
-
-    receiver = db.query(User).filter(User.id == request.receiver_id).first()
-    if receiver and receiver.fcm_token:
-        send_push_notification(
-            fcm_token=receiver.fcm_token,
-            title=current_user.full_name,
-            body=request.content[:100],
-            data={
-                "type": "message",
-                "sender_id": str(current_user.id),
-                "conversation_id": str(conversation.id)
-            }
-        )
-
-    return {
-        "id": str(msg.id),
-        "conversation_id": str(conversation.id),
-        "sender_id": str(current_user.id),
-        "content": msg.content,
-        "media_url": None,
-        "media_type": None,
-        "is_seen": False,
-        "created_at": str(msg.created_at)
-    }
-
-
-# ── SEND MEDIA — image / video / audio ───────────────────────
-@router.post("/send-media")
-async def send_media(
-    receiver_id: str = Form(...),
-    media_type: str = Form(...),   # 'image' | 'video' | 'audio'
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
-):
-    # Validate type
-    allowed_types = {
-        'image': ['image/jpeg', 'image/png', 'image/jpg', 'image/webp', 'image/gif'],
-        'video': ['video/mp4', 'video/quicktime', 'video/3gpp', 'video/x-msvideo'],
-        'audio': ['audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/wav',
-                  'audio/ogg', 'audio/webm', 'audio/x-m4a', 'application/octet-stream'],
-    }
-
-    if media_type not in allowed_types:
-        raise HTTPException(status_code=400, detail="Invalid media_type. Use image, video, or audio")
-
-    # Upload to Cloudinary
-    try:
-        contents = await file.read()
-
-        # Cloudinary resource type
-        resource_type_map = {'image': 'image', 'video': 'video', 'audio': 'video'}
-        resource_type = resource_type_map[media_type]
-
-        # Folder by type
-        folder_map = {'image': 'robina_chat_images', 'video': 'robina_chat_videos', 'audio': 'robina_chat_audio'}
-        folder = folder_map[media_type]
-
-        upload_options = {
-            'folder': folder,
-            'resource_type': resource_type,
-        }
-
-        # Image compression
-        if media_type == 'image':
-            upload_options['transformation'] = [
-                {'width': 1200, 'height': 1200, 'crop': 'limit'},
-                {'quality': 'auto:good'},
-                {'fetch_format': 'auto'}
-            ]
-
-        result = cloudinary.uploader.upload(contents, **upload_options)
-        media_url = result['secure_url']
-
-        # Video thumbnail
-        media_thumbnail = None
-        if media_type == 'video':
-            media_thumbnail = result.get('secure_url', '').replace(
-                '/upload/', '/upload/so_0,w_400,h_400,c_fill/'
-            ).replace('.mp4', '.jpg').replace('.mov', '.jpg')
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Media upload failed: {str(e)}")
-
-    # Save message
-    conversation = _get_or_create_conversation(db, str(current_user.id), receiver_id)
-
-    # Content = emoji label for display in conversation list
-    content_label = {'image': '📷 Image', 'video': '🎥 Video', 'audio': '🎤 Voice message'}
-
-    msg = Message(
-        conversation_id=conversation.id,
-        sender_id=current_user.id,
-        content=content_label[media_type],
-        media_url=media_url,
-        media_type=media_type,
-        media_thumbnail=media_thumbnail
-    )
-    db.add(msg)
-    conversation.updated_at = datetime.utcnow()
-
-    # Notification
-    notif_body = {'image': 'sent a photo', 'video': 'sent a video', 'audio': 'sent a voice message'}
-    notif = Notification(
-        user_id=receiver_id,
-        type=NotifType.message,
-        message=f"{current_user.full_name} {notif_body[media_type]}"
-    )
-    db.add(notif)
-    db.commit()
-
-    # FCM push
-    receiver = db.query(User).filter(User.id == receiver_id).first()
-    if receiver and receiver.fcm_token:
-        push_body = {'image': '📷 Photo', 'video': '🎥 Video', 'audio': '🎤 Voice message'}
-        send_push_notification(
-            fcm_token=receiver.fcm_token,
-            title=current_user.full_name,
-            body=push_body[media_type],
-            data={
-                "type": "message",
-                "sender_id": str(current_user.id),
-                "conversation_id": str(conversation.id),
-                "media_type": media_type
-            }
-        )
-
-    # Send via WebSocket to receiver if online
-    msg_payload = {
-        "type": "new_message",
-        "id": str(msg.id),
-        "conversation_id": str(conversation.id),
-        "sender_id": str(current_user.id),
-        "content": content_label[media_type],
-        "media_url": media_url,
-        "media_type": media_type,
-        "media_thumbnail": media_thumbnail,
-        "is_seen": False,
-        "created_at": str(msg.created_at)
-    }
-    await manager.send_to_user(receiver_id, msg_payload)
-
-    return {
-        "id": str(msg.id),
-        "conversation_id": str(conversation.id),
-        "sender_id": str(current_user.id),
-        "content": content_label[media_type],
-        "media_url": media_url,
-        "media_type": media_type,
-        "media_thumbnail": media_thumbnail,
-        "is_seen": False,
-        "created_at": str(msg.created_at)
-    }
-
-
-# ── USER ONLINE STATUS ────────────────────────────────────────
 @router.get("/status/{user_id}")
 def get_user_status(
     user_id: str,
-    current_user: User = Depends(get_verified_user),
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        return {"is_online": False, "last_seen": None}
     return {
-        "is_online": manager.is_online(user_id),
-        "last_seen": str(user.last_seen) if user.last_seen else None
+        "is_online": manager.is_online(str(user_id)),
+        "last_seen": user.last_seen.isoformat() if user.last_seen else None,
     }
