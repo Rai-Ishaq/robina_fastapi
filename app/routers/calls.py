@@ -17,6 +17,7 @@ router = APIRouter(prefix="/calls", tags=["Calls"])
 @router.post("/token")
 def generate_call_token(
     channel_name: str,
+    uid: int = 0,
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
@@ -33,12 +34,12 @@ def generate_call_token(
         expiry = int(time.time()) + 3600
         try:
             token = RtcTokenBuilder.buildTokenWithUid(
-                app_id, app_certificate, channel_name, 0, 1, expiry, expiry)
+                app_id, app_certificate, channel_name, uid, 1, expiry, expiry)
         except TypeError:
             token = RtcTokenBuilder.buildTokenWithUid(
-                app_id, app_certificate, channel_name, 0, 1, expiry)
+                app_id, app_certificate, channel_name, uid, 1, expiry)
 
-        return {"token": token, "channel_name": channel_name, "app_id": app_id, "uid": 0}
+        return {"token": token, "channel_name": channel_name, "app_id": app_id, "uid": uid}
 
     except ImportError:
         raise HTTPException(status_code=500, detail="agora_token_builder package missing.")

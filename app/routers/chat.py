@@ -76,6 +76,20 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             user.last_seen = datetime.utcnow()
             db.commit()
 
+            # Broadcast online status
+            convs = db.query(Conversation).filter(
+                or_(Conversation.user1_id == user_id, Conversation.user2_id == user_id)
+            ).all()
+            for conv in convs:
+                other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
+                if manager.is_online(other_id):
+                    import asyncio
+                    asyncio.create_task(manager.send_to_user(other_id, {
+                        "type": "user_online",
+                        "user_id": user_id,
+                        "last_seen": str(user.last_seen)
+                    }))
+
         await websocket.send_text(json.dumps({
             "type": "connected",
             "message": "Connected successfully"
@@ -136,7 +150,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                     "created_at": str(msg.created_at)
                 }
                 await manager.send_to_user(receiver_id, msg_payload)
-                await manager.send_to_user(user_id, msg_payload)
+                # Sender already adds via REST internally, DO NOT broadcast back to sender to prevent duplicates
 
             elif msg_type == "seen":
                 message_id = message_data.get("message_id")
@@ -151,49 +165,21 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                             {"type": "message_seen", "message_id": message_id}
                         )
 
-            elif msg_type == "typing":
-                receiver_id = message_data.get("receiver_id")
-                if receiver_id:
-                    await manager.send_to_user(receiver_id, {
-                        "type": "typing",
-                        "user_id": user_id,
-                        "is_typing": message_data.get("is_typing", True)
-                    })
-
-            elif msg_type == "stop_typing":
-                receiver_id = message_data.get("receiver_id") or message_data.get("conversation_id")
-                conv_id = message_data.get("conversation_id")
-                # Broadcast to conversation partner
-                if conv_id:
-                    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
-                    if conv:
-                        other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                        await manager.send_to_user(other_id, {
-                            "type": "stop_typing",
-                            "user_id": user_id
-                        })
-
-            elif msg_type == "recording":
+            elif msg_type in ["typing", "stop_typing", "recording", "stop_recording"]:
                 conv_id = message_data.get("conversation_id")
                 if conv_id:
                     conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
                     if conv:
                         other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                        await manager.send_to_user(other_id, {
-                            "type": "recording",
-                            "user_id": user_id
-                        })
-
-            elif msg_type == "stop_recording":
-                conv_id = message_data.get("conversation_id")
-                if conv_id:
-                    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
-                    if conv:
-                        other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
-                        await manager.send_to_user(other_id, {
-                            "type": "stop_recording",
-                            "user_id": user_id
-                        })
+                        payload = {
+                            "type": msg_type,
+                            "user_id": user_id,
+                            "conversation_id": conv_id
+                        }
+                        if msg_type == "typing":
+                            payload["is_typing"] = message_data.get("is_typing", True)
+                        
+                        await manager.send_to_user(other_id, payload)
 
             elif msg_type == "join_conversation":
                 conv_id = message_data.get("conversation_id")
@@ -250,6 +236,20 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             if u:
                 u.last_seen = datetime.utcnow()
                 db_update.commit()
+                
+                # Broadcast offline status
+                convs = db_update.query(Conversation).filter(
+                    or_(Conversation.user1_id == user_id, Conversation.user2_id == user_id)
+                ).all()
+                for conv in convs:
+                    other_id = str(conv.user2_id) if str(conv.user1_id) == user_id else str(conv.user1_id)
+                    if manager.is_online(other_id):
+                        import asyncio
+                        asyncio.create_task(manager.send_to_user(other_id, {
+                            "type": "user_offline",
+                            "user_id": user_id,
+                            "last_seen": str(u.last_seen)
+                        }))
         finally:
             db_update.close()
     except Exception as e:
