@@ -4,6 +4,7 @@ from sqlalchemy import Column, String, DateTime, Enum as SQLEnum
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime
 import enum
+from sqlalchemy import Boolean
 from app.database import Base
 
 class CallType(str, enum.Enum):
@@ -25,4 +26,5 @@ class CallLog(Base):
     call_type = Column(SQLEnum(CallType), default=CallType.audio)
     status = Column(SQLEnum(CallStatus), default=CallStatus.missed)
     duration_seconds = Column(String, default="0")
+    is_seen = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)

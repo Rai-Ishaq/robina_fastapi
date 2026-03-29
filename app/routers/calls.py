@@ -259,6 +259,7 @@ def get_call_history(
                 "status": log.status if isinstance(log.status, str) else log.status.value,
                 "is_outgoing": is_outgoing,
                 "duration_seconds": log.duration_seconds or "0",
+                "is_seen": getattr(log, 'is_seen', False),
                 "created_at": created_at_str,
             })
 
@@ -266,4 +267,27 @@ def get_call_history(
 
     except Exception as e:
         logger.error(f"Call history error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return []
+
+# ── Mark missed calls as seen ──────────────────────────────────────────────
+@router.post("/mark-seen")
+def mark_missed_calls_seen(
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db)
+):
+    from app.models.call_log import CallLog, CallStatus
+    try:
+        missed_logs = db.query(CallLog).filter(
+            CallLog.receiver_id == current_user.id,
+            CallLog.status == CallStatus.missed,
+            CallLog.is_seen == False
+        ).all()
+        
+        for log in missed_logs:
+            log.is_seen = True
+        
+        db.commit()
+        return {"success": True, "message": f"Marked {len(missed_logs)} missed calls as seen."}
+    except Exception as e:
+        logger.error(f"Mark seen error: {e}")
+        return {"success": False, "message": str(e)}
