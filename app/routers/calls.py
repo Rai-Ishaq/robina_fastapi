@@ -1,5 +1,5 @@
 import time
-from agora_token_builder import RtcTokenBuilder, RtcRole
+from agora_token_builder import RtcTokenBuilder
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, desc
@@ -27,7 +27,7 @@ def get_agora_token(
         settings.AGORA_APP_CERTIFICATE,
         channel_name,
         uid,
-        RtcRole.Publisher,
+        1,  # Role_Publisher = 1
         expire,
     )
     return {"token": token, "app_id": settings.AGORA_APP_ID}
