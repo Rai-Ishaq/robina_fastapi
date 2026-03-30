@@ -45,13 +45,16 @@ async def initiate_call(
     if not receiver:
         return {"error": "Receiver not found"}
 
+    # Get caller profile photo
+    caller_profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
+    caller_photo = caller_profile.profile_photo if caller_profile else None
+
     call_log = CallLog(
         caller_id=current_user.id,
         receiver_id=receiver_id,
         call_type=CallType.video if call_type == "video" else CallType.audio,
-        status=CallStatus.initiated,
+        status=CallStatus.missed,   # Default missed — updated on accept/end
         channel_name=channel_name,
-        is_outgoing_for_caller=True,
     )
     db.add(call_log)
     db.commit()
@@ -62,6 +65,7 @@ async def initiate_call(
         "call_log_id": str(call_log.id),
         "caller_id": str(current_user.id),
         "caller_name": current_user.full_name or "User",
+        "caller_photo": caller_photo or "",
         "channel_name": channel_name,
         "call_type": call_type,
     }
@@ -72,12 +76,13 @@ async def initiate_call(
         send_call_notification(
             fcm_token=receiver.fcm_token,
             data={
+                "type": "call",
                 "call_log_id": str(call_log.id),
                 "caller_id": str(current_user.id),
                 "caller_name": current_user.full_name or "User",
-                "channel_name": channel_name,
+                "caller_photo": caller_photo or "",
+                "channel_id": channel_name,
                 "call_type": call_type,
-                "type": "incoming_call",
             },
         )
 
@@ -96,8 +101,20 @@ def accept_call(
 ):
     log = db.query(CallLog).filter(CallLog.id == call_log_id).first()
     if log:
-        log.status = CallStatus.connected
+        log.status = CallStatus.completed  # Mark as answered
         db.commit()
+
+        # Notify caller that call was accepted
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(manager.send_to(str(log.caller_id), {
+                "type": "call_accepted",
+                "call_log_id": call_log_id,
+            }))
+        except Exception:
+            pass
+
     return {"success": True}
 
 
@@ -127,17 +144,18 @@ async def end_call(
 ):
     log = db.query(CallLog).filter(CallLog.id == call_log_id).first()
     if log:
-        if log.status == CallStatus.initiated:
-            log.status = CallStatus.missed
+        if log.status == CallStatus.missed:
+            pass  # Stay missed if never answered
         else:
             log.status = CallStatus.completed
-        log.duration_seconds = duration_seconds
+        log.duration_seconds = str(duration_seconds)
         db.commit()
 
         other_id = str(log.receiver_id) if str(log.caller_id) == str(current_user.id) else str(log.caller_id)
         await manager.send_to(other_id, {
             "type": "call_ended",
             "call_log_id": call_log_id,
+            "duration_seconds": duration_seconds,
         })
     return {"success": True}
 
@@ -159,6 +177,8 @@ def get_call_history(
         if not other:
             continue
         profile = db.query(Profile).filter(Profile.user_id == other_id).first()
+        status_val = log.status.value if log.status else "missed"
+        is_missed = (status_val == "missed") and not is_outgoing
 
         result.append({
             "id": str(log.id),
@@ -166,9 +186,10 @@ def get_call_history(
             "other_user_name": other.full_name or "User",
             "other_user_photo": profile.profile_photo if profile else None,
             "call_type": log.call_type.value if log.call_type else "audio",
-            "status": log.status.value if log.status else "missed",
+            "status": status_val,
             "is_outgoing": is_outgoing,
-            "duration_seconds": log.duration_seconds or 0,
+            "is_missed": is_missed,
+            "duration_seconds": int(log.duration_seconds or 0),
             "is_seen": log.is_seen,
             "created_at": log.created_at.isoformat(),
         })

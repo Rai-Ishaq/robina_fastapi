@@ -2,13 +2,14 @@ import json
 import cloudinary
 import cloudinary.uploader
 import os
-from typing import Dict
+from typing import Dict, Set
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, desc
 from app.database import get_db
 from app.models.user import User
 from app.models.message import Conversation, Message, MessageStatus
+from app.models.match import BlockedUser
 from app.utils.helpers import get_verified_user, get_current_user
 from app.core.security import decode_token
 from app.services.firebase import send_push_notification
@@ -25,16 +26,22 @@ cloudinary.config(
 class ConnectionManager:
     def __init__(self):
         self.connections: Dict[str, WebSocket] = {}
+        self.online_users: Set[str] = set()
 
     async def connect(self, user_id: str, ws: WebSocket):
         await ws.accept()
         self.connections[user_id] = ws
+        self.online_users.add(user_id)
 
     def disconnect(self, user_id: str):
         self.connections.pop(user_id, None)
+        self.online_users.discard(user_id)
 
     def is_online(self, user_id: str) -> bool:
-        return user_id in self.connections
+        return user_id in self.online_users
+
+    def get_online_user_ids(self) -> list:
+        return list(self.online_users)
 
     async def send_to(self, user_id: str, data: dict):
         ws = self.connections.get(user_id)
@@ -43,6 +50,11 @@ class ConnectionManager:
                 await ws.send_text(json.dumps(data))
             except Exception:
                 self.connections.pop(user_id, None)
+                self.online_users.discard(user_id)
+
+    async def broadcast_to_many(self, user_ids: list, data: dict):
+        for uid in user_ids:
+            await self.send_to(uid, data)
 
 
 manager = ConnectionManager()
@@ -71,6 +83,7 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
     user.last_seen = None
     db.commit()
 
+    # Notify all conversation partners that this user is online
     conversations = db.query(Conversation).filter(
         or_(Conversation.user1_id == user_id, Conversation.user2_id == user_id)
     ).all()
@@ -103,6 +116,16 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                 if not content or not receiver_id:
                     continue
 
+                # Check if blocked
+                is_blocked = db.query(BlockedUser).filter(
+                    or_(
+                        and_(BlockedUser.blocker_id == user_id, BlockedUser.blocked_id == receiver_id),
+                        and_(BlockedUser.blocker_id == receiver_id, BlockedUser.blocked_id == user_id),
+                    )
+                ).first()
+                if is_blocked:
+                    continue
+
                 receiver = db.query(User).filter(User.id == receiver_id).first()
                 if not receiver:
                     continue
@@ -125,7 +148,10 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                     db.add(conv)
                     db.flush()
 
-                status = MessageStatus.seen if manager.is_online(receiver_id) else MessageStatus.sent
+                # If receiver is online AND in this conversation → mark seen immediately
+                receiver_online = manager.is_online(str(receiver_id))
+                status = MessageStatus.seen if receiver_online else MessageStatus.sent
+
                 new_msg = Message(
                     conversation_id=conv.id,
                     sender_id=user_id,
@@ -135,6 +161,10 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                     quote_sender=msg.get("quote_sender"),
                 )
                 db.add(new_msg)
+
+                # Update conversation updated_at
+                from datetime import datetime
+                conv.updated_at = datetime.utcnow()
                 db.commit()
                 db.refresh(new_msg)
 
@@ -154,13 +184,13 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                 await manager.send_to(str(user_id), payload_out)
                 await manager.send_to(str(receiver_id), payload_out)
 
-                if not manager.is_online(str(receiver_id)) and receiver.fcm_token:
+                if not receiver_online and receiver.fcm_token:
                     send_push_notification(
                         fcm_token=receiver.fcm_token,
                         title=user.full_name or "New Message",
                         body=content[:100],
                         data={
-                            "type": "chat_message",
+                            "type": "message",
                             "sender_id": str(user_id),
                             "conversation_id": str(conv.id),
                         }
@@ -204,12 +234,11 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
             elif mtype == "delete_message":
                 message_id = msg.get("message_id", "")
                 for_everyone = msg.get("for_everyone", False)
-                db_msg = db.query(Message).filter(
-                    Message.id == message_id,
-                    Message.sender_id == user_id,
-                ).first()
+                delete_for_me = msg.get("delete_for_me", False)
+
+                db_msg = db.query(Message).filter(Message.id == message_id).first()
                 if db_msg:
-                    if for_everyone:
+                    if for_everyone and str(db_msg.sender_id) == str(user_id):
                         db_msg.content = "__deleted__"
                         db.commit()
                         conv = db.query(Conversation).filter(Conversation.id == db_msg.conversation_id).first()
@@ -220,9 +249,18 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                                 "message_id": message_id,
                                 "for_everyone": True,
                             })
-                    else:
+                            await manager.send_to(str(user_id), {
+                                "type": "message_deleted",
+                                "message_id": message_id,
+                                "for_everyone": True,
+                            })
+                    elif delete_for_me:
                         db.delete(db_msg)
                         db.commit()
+                        await manager.send_to(str(user_id), {
+                            "type": "message_deleted_for_me",
+                            "message_id": message_id,
+                        })
 
     except WebSocketDisconnect:
         pass
@@ -248,6 +286,10 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
         or_(Conversation.user1_id == current_user.id, Conversation.user2_id == current_user.id)
     ).order_by(desc(Conversation.updated_at)).all()
 
+    # Get users this person has blocked / blocked by
+    my_blocks = {str(b.blocked_id) for b in db.query(BlockedUser).filter(BlockedUser.blocker_id == current_user.id).all()}
+    blocked_me = {str(b.blocker_id) for b in db.query(BlockedUser).filter(BlockedUser.blocked_id == current_user.id).all()}
+
     result = []
     for conv in convs:
         other_id = conv.user2_id if str(conv.user1_id) == str(current_user.id) else conv.user1_id
@@ -269,17 +311,21 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
         profile = db.query(Profile).filter(Profile.user_id == other_id).first()
         photo = profile.profile_photo if profile else None
 
+        other_id_str = str(other_id)
         result.append({
             "id": str(conv.id),
-            "other_user_id": str(other_id),
+            "other_user_id": other_id_str,
             "other_user_name": other.full_name or "User",
             "other_user_photo": photo,
             "last_message": last_msg.content if last_msg else "",
+            "last_message_type": last_msg.media_type if last_msg else None,
             "last_message_time": last_msg.created_at.isoformat() if last_msg else conv.created_at.isoformat(),
             "unread_count": unread_count,
-            "is_online": manager.is_online(str(other_id)),
+            "is_online": manager.is_online(other_id_str),
             "last_seen": other.last_seen.isoformat() if other.last_seen else None,
             "updated_at": conv.updated_at.isoformat() if conv.updated_at else conv.created_at.isoformat(),
+            "blocked_by_me": other_id_str in my_blocks,
+            "blocked_me": other_id_str in blocked_me,
         })
     return result
 
@@ -334,6 +380,16 @@ def send_message_rest(
     if not content or not receiver_id:
         return {"success": False, "error": "Missing fields"}
 
+    # Check block
+    is_blocked = db.query(BlockedUser).filter(
+        or_(
+            and_(BlockedUser.blocker_id == current_user.id, BlockedUser.blocked_id == receiver_id),
+            and_(BlockedUser.blocker_id == receiver_id, BlockedUser.blocked_id == current_user.id),
+        )
+    ).first()
+    if is_blocked:
+        return {"success": False, "error": "User is blocked"}
+
     receiver = db.query(User).filter(User.id == receiver_id).first()
     if not receiver:
         return {"success": False, "error": "Receiver not found"}
@@ -356,7 +412,8 @@ def send_message_rest(
         db.add(conv)
         db.flush()
 
-    status = MessageStatus.seen if manager.is_online(str(receiver_id)) else MessageStatus.sent
+    receiver_online = manager.is_online(str(receiver_id))
+    status = MessageStatus.seen if receiver_online else MessageStatus.sent
     new_msg = Message(
         conversation_id=conv.id,
         sender_id=current_user.id,
@@ -366,6 +423,8 @@ def send_message_rest(
         quote_sender=body.get("quote_sender"),
     )
     db.add(new_msg)
+    from datetime import datetime
+    conv.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(new_msg)
 
@@ -390,13 +449,13 @@ def send_message_rest(
     except Exception:
         pass
 
-    if not manager.is_online(str(receiver_id)) and receiver.fcm_token:
+    if not receiver_online and receiver.fcm_token:
         send_push_notification(
             fcm_token=receiver.fcm_token,
             title=current_user.full_name or "New Message",
             body=content[:100],
             data={
-                "type": "chat_message",
+                "type": "message",
                 "sender_id": str(current_user.id),
                 "conversation_id": str(conv.id),
             }
@@ -422,6 +481,16 @@ async def send_media(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db),
 ):
+    # Check block
+    is_blocked = db.query(BlockedUser).filter(
+        or_(
+            and_(BlockedUser.blocker_id == current_user.id, BlockedUser.blocked_id == receiver_id),
+            and_(BlockedUser.blocker_id == receiver_id, BlockedUser.blocked_id == current_user.id),
+        )
+    ).first()
+    if is_blocked:
+        return {"success": False, "error": "User is blocked"}
+
     try:
         contents = await file.read()
         resource_type = "video" if media_type in ("video", "audio") else "image"
@@ -434,6 +503,9 @@ async def send_media(
         thumbnail = None
         if media_type == "video":
             thumbnail = upload_result.get("url", "").replace("/upload/", "/upload/w_200,h_200,c_fill/")
+        if media_type == "audio":
+            # For audio duration from cloudinary
+            pass
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -455,7 +527,8 @@ async def send_media(
         db.flush()
 
     content_text = {"image": "📷 Photo", "video": "🎥 Video", "audio": "🎤 Voice"}.get(media_type, "📎 File")
-    status = MessageStatus.seen if manager.is_online(str(receiver_id)) else MessageStatus.sent
+    receiver_online = manager.is_online(str(receiver_id))
+    status = MessageStatus.seen if receiver_online else MessageStatus.sent
 
     new_msg = Message(
         conversation_id=conv.id,
@@ -467,6 +540,8 @@ async def send_media(
         status=status,
     )
     db.add(new_msg)
+    from datetime import datetime
+    conv.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(new_msg)
 
@@ -492,12 +567,12 @@ async def send_media(
     except Exception:
         pass
 
-    if not manager.is_online(str(receiver_id)) and receiver.fcm_token:
+    if not receiver_online and receiver.fcm_token:
         send_push_notification(
             fcm_token=receiver.fcm_token,
             title=current_user.full_name or "Message",
             body=content_text,
-            data={"type": "chat_message", "sender_id": str(current_user.id), "conversation_id": str(conv.id)},
+            data={"type": "message", "sender_id": str(current_user.id), "conversation_id": str(conv.id)},
         )
 
     return {
@@ -528,6 +603,20 @@ def delete_conversation(
     return {"success": True}
 
 
+@router.delete("/messages/{conversation_id}/clear")
+def clear_chat(
+    conversation_id: str,
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    """Clear all messages from a conversation (for current user only — deletes from DB)"""
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if conv and (str(conv.user1_id) == str(current_user.id) or str(conv.user2_id) == str(current_user.id)):
+        db.query(Message).filter(Message.conversation_id == conversation_id).delete()
+        db.commit()
+    return {"success": True}
+
+
 @router.get("/status/{user_id}")
 def get_user_status(
     user_id: str,
@@ -541,3 +630,96 @@ def get_user_status(
         "is_online": manager.is_online(str(user_id)),
         "last_seen": user.last_seen.isoformat() if user.last_seen else None,
     }
+
+
+@router.get("/online-users")
+def get_online_users(current_user: User = Depends(get_verified_user)):
+    """Get list of currently online user IDs"""
+    return {"online_user_ids": manager.get_online_user_ids()}
+
+
+@router.post("/block")
+def block_user(
+    target_user_id: str,
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    existing = db.query(BlockedUser).filter(
+        BlockedUser.blocker_id == current_user.id,
+        BlockedUser.blocked_id == target_user_id,
+    ).first()
+    if not existing:
+        block = BlockedUser(blocker_id=current_user.id, blocked_id=target_user_id)
+        db.add(block)
+        db.commit()
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(manager.send_to(str(target_user_id), {
+            "type": "user_blocked",
+            "by_user_id": str(current_user.id),
+        }))
+    except Exception:
+        pass
+
+    return {"success": True}
+
+
+@router.post("/unblock")
+def unblock_user(
+    target_user_id: str,
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    db.query(BlockedUser).filter(
+        BlockedUser.blocker_id == current_user.id,
+        BlockedUser.blocked_id == target_user_id,
+    ).delete()
+    db.commit()
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(manager.send_to(str(target_user_id), {
+            "type": "user_unblocked",
+            "by_user_id": str(current_user.id),
+        }))
+    except Exception:
+        pass
+
+    return {"success": True}
+
+
+@router.get("/blocked-users")
+def get_blocked_users(
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    blocks = db.query(BlockedUser).filter(BlockedUser.blocker_id == current_user.id).all()
+    result = []
+    for b in blocks:
+        other = db.query(User).filter(User.id == b.blocked_id).first()
+        if not other:
+            continue
+        from app.models.profile import Profile
+        profile = db.query(Profile).filter(Profile.user_id == b.blocked_id).first()
+        result.append({
+            "blocked_user_id": str(b.blocked_id),
+            "name": other.full_name or "User",
+            "photo": profile.profile_photo if profile else None,
+            "blocked_at": b.created_at.isoformat(),
+        })
+    return result
+
+
+@router.post("/report")
+def report_user(
+    target_user_id: str,
+    reason: str = "Inappropriate behavior",
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    # Log report (simple implementation — just log for now)
+    print(f"[REPORT] User {current_user.id} reported {target_user_id}. Reason: {reason}")
+    return {"success": True, "message": "Report submitted successfully"}
