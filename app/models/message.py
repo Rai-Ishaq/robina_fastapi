@@ -44,6 +44,9 @@ class Message(Base):
     quote_content = Column(Text, nullable=True)
     quote_sender = Column(String, nullable=True)
 
+    # Delete for me functionality
+    deleted_by = Column(String, default="")
+
     status = Column(Enum(MessageStatus, native_enum=False, length=50), default=MessageStatus.sent)
     created_at = Column(DateTime, default=datetime.utcnow)
 

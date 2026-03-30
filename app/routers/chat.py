@@ -255,8 +255,15 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                                 "for_everyone": True,
                             })
                     elif delete_for_me:
-                        db.delete(db_msg)
-                        db.commit()
+                        user_str = str(user_id)
+                        current_deleted = db_msg.deleted_by or ""
+                        if user_str not in current_deleted:
+                            if current_deleted:
+                                db_msg.deleted_by = current_deleted + "," + user_str
+                            else:
+                                db_msg.deleted_by = user_str
+                            db.commit()
+
                         await manager.send_to(str(user_id), {
                             "type": "message_deleted_for_me",
                             "message_id": message_id,
@@ -298,13 +305,15 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
             continue
 
         last_msg = db.query(Message).filter(
-            Message.conversation_id == conv.id
+            Message.conversation_id == conv.id,
+            ~Message.deleted_by.contains(str(current_user.id))
         ).order_by(desc(Message.created_at)).first()
 
         unread_count = db.query(Message).filter(
             Message.conversation_id == conv.id,
             Message.sender_id != current_user.id,
             Message.status != MessageStatus.seen,
+            ~Message.deleted_by.contains(str(current_user.id))
         ).count()
 
         from app.models.profile import Profile
@@ -325,7 +334,7 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
             "last_seen": other.last_seen.isoformat() if other.last_seen else None,
             "updated_at": conv.updated_at.isoformat() if conv.updated_at else conv.created_at.isoformat(),
             "blocked_by_me": other_id_str in my_blocks,
-            "blocked_me": other_id_str in blocked_me,
+            "blocked_by_them": other_id_str in blocked_me,
         })
     return result
 
@@ -344,7 +353,8 @@ def get_messages(
         return []
 
     msgs = db.query(Message).filter(
-        Message.conversation_id == conversation_id
+        Message.conversation_id == conversation_id,
+        ~Message.deleted_by.contains(str(current_user.id))
     ).order_by(Message.created_at).all()
 
     return [
@@ -478,6 +488,8 @@ async def send_media(
     receiver_id: str = Form(...),
     media_type: str = Form(...),
     file: UploadFile = File(...),
+    quote_content: str = Form(None),
+    quote_sender: str = Form(None),
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db),
 ):
@@ -538,6 +550,8 @@ async def send_media(
         media_type=media_type,
         media_thumbnail=thumbnail,
         status=status,
+        quote_content=quote_content,
+        quote_sender=quote_sender,
     )
     db.add(new_msg)
     from datetime import datetime
