@@ -35,11 +35,12 @@ def get_agora_token(
 
 @router.post("/initiate")
 async def initiate_call(
-    receiver_id: str,
-    call_type: str = "audio",
+    body: dict,
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db),
 ):
+    receiver_id = body.get('receiver_id', '')
+    call_type = body.get('call_type', 'audio')
     receiver = db.query(User).filter(User.id == receiver_id).first()
     if not receiver:
         return {"error": "Receiver not found"}
