@@ -453,9 +453,9 @@ def send_message_rest(
 
     import asyncio
     try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(manager.send_to(str(receiver_id), payload_out))
-        loop.create_task(manager.send_to(str(current_user.id), payload_out))
+        loop = asyncio.get_running_loop()
+        asyncio.ensure_future(manager.send_to(str(receiver_id), payload_out))
+        asyncio.ensure_future(manager.send_to(str(current_user.id), payload_out))
     except Exception:
         pass
 
@@ -575,9 +575,9 @@ async def send_media(
 
     import asyncio
     try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(manager.send_to(str(receiver_id), payload_out))
-        loop.create_task(manager.send_to(str(current_user.id), payload_out))
+        loop = asyncio.get_running_loop()
+        asyncio.ensure_future(manager.send_to(str(receiver_id), payload_out))
+        asyncio.ensure_future(manager.send_to(str(current_user.id), payload_out))
     except Exception:
         pass
 
@@ -669,8 +669,8 @@ def block_user(
 
     import asyncio
     try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(manager.send_to(str(target_user_id), {
+        loop = asyncio.get_running_loop()
+        asyncio.ensure_future(manager.send_to(str(target_user_id), {
             "type": "user_blocked",
             "by_user_id": str(current_user.id),
         }))
@@ -694,8 +694,8 @@ def unblock_user(
 
     import asyncio
     try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(manager.send_to(str(target_user_id), {
+        loop = asyncio.get_running_loop()
+        asyncio.ensure_future(manager.send_to(str(target_user_id), {
             "type": "user_unblocked",
             "by_user_id": str(current_user.id),
         }))

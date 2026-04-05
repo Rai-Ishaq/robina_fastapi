@@ -36,7 +36,6 @@ def get_agora_token(
 @router.post("/initiate")
 async def initiate_call(
     receiver_id: str,
-    channel_name: str,
     call_type: str = "audio",
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db),
@@ -49,11 +48,13 @@ async def initiate_call(
     caller_profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     caller_photo = caller_profile.profile_photo if caller_profile else None
 
+    import uuid as _uuid
+    channel_name = f"robina_{_uuid.uuid4().hex[:12]}"
     call_log = CallLog(
         caller_id=current_user.id,
         receiver_id=receiver_id,
         call_type=CallType.video if call_type == "video" else CallType.audio,
-        status=CallStatus.missed,   # Default missed — updated on accept/end
+        status=CallStatus.missed,
         channel_name=channel_name,
     )
     db.add(call_log)
@@ -86,10 +87,24 @@ async def initiate_call(
             },
         )
 
+    import uuid, time
+    uid = int(str(current_user.id).replace("-","")[:8], 16) % 100000
+    expire = int(time.time()) + 3600
+    token = RtcTokenBuilder.buildTokenWithUid(
+        settings.AGORA_APP_ID,
+        settings.AGORA_APP_CERTIFICATE,
+        channel_name,
+        uid,
+        1,
+        expire,
+    )
     return {
         "call_log_id": str(call_log.id),
         "channel_name": channel_name,
+        "agora_token": token,
+        "agora_uid": uid,
         "app_id": settings.AGORA_APP_ID,
+        "receiver_photo": caller_photo or "",
     }
 
 
@@ -107,8 +122,8 @@ def accept_call(
         # Notify caller that call was accepted
         import asyncio
         try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(manager.send_to(str(log.caller_id), {
+            loop = asyncio.get_running_loop()
+            asyncio.ensure_future(manager.send_to(str(log.caller_id), {
                 "type": "call_accepted",
                 "call_log_id": call_log_id,
             }))
