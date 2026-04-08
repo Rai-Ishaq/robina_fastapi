@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, DateTime, Enum
+from sqlalchemy import Column, String, Boolean, DateTime, Enum, Date
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -29,6 +29,11 @@ class User(Base):
     last_seen = Column(DateTime, default=datetime.utcnow)
     fcm_token = Column(String(500), nullable=True)
     google_uid = Column(String(128), nullable=True, unique=True)  # ✅ Google Sign In
+    user_code = Column(String(20), unique=True, nullable=True)
+    date_of_birth = Column(Date, nullable=True)
+    verification_status = Column(String(20), default="none")
+    verification_doc_url = Column(String(500), nullable=True)
+    is_online = Column(Boolean, default=False)
 
     # Relationships
     profile = relationship("Profile", back_populates="user", uselist=False)

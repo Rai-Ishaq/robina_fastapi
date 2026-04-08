@@ -88,6 +88,8 @@ async def initiate_call(
             },
         )
 
+    receiver_profile = db.query(Profile).filter(Profile.user_id == receiver_id).first()
+    receiver_photo = receiver_profile.profile_photo if receiver_profile else ""
     import uuid, time
     uid = int(str(current_user.id).replace("-","")[:8], 16) % 100000
     expire = int(time.time()) + 3600
@@ -105,7 +107,7 @@ async def initiate_call(
         "agora_token": token,
         "agora_uid": uid,
         "app_id": settings.AGORA_APP_ID,
-        "receiver_photo": caller_photo or "",
+        "receiver_photo": receiver_photo or "",
     }
 
 

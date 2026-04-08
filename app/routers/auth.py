@@ -50,6 +50,14 @@ def signup(request: SignupRequest, db: Session = Depends(get_db)):
         )
 
     # Create user
+    # Generate unique user code
+    last = db.execute(__import__("sqlalchemy").text("SELECT user_code FROM users WHERE user_code IS NOT NULL ORDER BY user_code DESC LIMIT 1")).fetchone()
+    if last and last[0]:
+        num = int(last[0].replace("RB-", "")) + 1
+    else:
+        num = 1
+    user_code = f"RB-{str(num).zfill(5)}"
+
     user = User(
         full_name=request.full_name,
         email=request.email,
@@ -57,6 +65,8 @@ def signup(request: SignupRequest, db: Session = Depends(get_db)):
         country_code=request.country_code,
         password_hash=hash_password(request.password),
         gender=request.gender,
+        date_of_birth=request.date_of_birth,
+        user_code=user_code,
         is_verified=False
     )
     db.add(user)
@@ -353,5 +363,9 @@ def get_me(current_user: User = Depends(get_current_user)):
         "is_verified": current_user.is_verified,
         "is_premium": current_user.is_premium,
         "profile_complete": current_user.profile_complete,
-        "last_seen": str(current_user.last_seen)
+        "last_seen": str(current_user.last_seen),
+        "user_code": current_user.user_code or "",
+        "date_of_birth": str(current_user.date_of_birth) if current_user.date_of_birth else "",
+        "verification_status": current_user.verification_status or "none",
+        "created_at": current_user.created_at.isoformat() if current_user.created_at else "",
     }

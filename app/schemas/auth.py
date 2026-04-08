@@ -1,4 +1,5 @@
 from pydantic import BaseModel, EmailStr, validator
+from datetime import date
 from typing import Optional
 from uuid import UUID
 
@@ -9,6 +10,7 @@ class SignupRequest(BaseModel):
     country_code: str = "+92"
     password: str
     gender: str
+    date_of_birth: date
 
     @validator("full_name")
     def name_not_empty(cls, v):

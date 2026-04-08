@@ -305,4 +305,53 @@ def get_profile(
         "smoking": profile.smoking if profile else None,
         "living_style": profile.living_style if profile else None,
         "profile_views": profile.profile_views if profile else 0,
+        "user_code": user.user_code or "",
+        "is_premium": user.is_premium or False,
+        "verification_status": user.verification_status or "none",
+        "created_at": user.created_at.isoformat() if user.created_at else "",
+        "date_of_birth": str(user.date_of_birth) if user.date_of_birth else "",
+    }
+
+@router.post("/verify-identity")
+async def verify_identity(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    """Upload CNIC photo for yellow badge verification"""
+    try:
+        contents = await file.read()
+        upload_result = cloudinary.uploader.upload(
+            contents,
+            resource_type="image",
+            folder="robina_verification",
+            public_id=f"cnic_{current_user.id}",
+            overwrite=True,
+        )
+        doc_url = upload_result.get("secure_url", "")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+    user = db.query(User).filter(User.id == current_user.id).first()
+    user.verification_doc_url = doc_url
+    user.verification_status = "pending"
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "CNIC uploaded successfully. Verification pending.",
+        "verification_status": "pending",
+        "doc_url": doc_url,
+    }
+
+
+@router.get("/verification-status")
+def get_verification_status(
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.id == current_user.id).first()
+    return {
+        "verification_status": user.verification_status or "none",
+        "verification_doc_url": user.verification_doc_url or "",
     }
