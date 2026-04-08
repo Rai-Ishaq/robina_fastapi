@@ -335,6 +335,7 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
             "updated_at": conv.updated_at.isoformat() if conv.updated_at else conv.created_at.isoformat(),
             "blocked_by_me": other_id_str in my_blocks,
             "blocked_by_them": other_id_str in blocked_me,
+            "other_user_code": other.user_code or "",
         })
     return result
 
