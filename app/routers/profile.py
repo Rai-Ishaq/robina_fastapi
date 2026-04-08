@@ -332,7 +332,7 @@ async def verify_identity(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-user = db.query(User).filter(User.id == current_user.id).first()
+    user = db.query(User).filter(User.id == current_user.id).first()
     user.verification_doc_url = doc_url
     try:
         import easyocr, numpy as np, re, io
