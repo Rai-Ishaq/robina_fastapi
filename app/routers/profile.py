@@ -332,18 +332,40 @@ async def verify_identity(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-    user = db.query(User).filter(User.id == current_user.id).first()
+user = db.query(User).filter(User.id == current_user.id).first()
     user.verification_doc_url = doc_url
-    user.verification_status = "pending"
-    db.commit()
-
-    return {
-        "success": True,
-        "message": "CNIC uploaded successfully. Verification pending.",
-        "verification_status": "pending",
-        "doc_url": doc_url,
-    }
-
+    try:
+        import easyocr, numpy as np, re, io
+        from PIL import Image
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        results = reader.readtext(np.array(img), detail=0)
+        text = " ".join(results).upper()
+        dob_m = re.search(r"(\d{2})[.\-/](\d{2})[.\-/](\d{4})", text)
+        gen_m = "male" if (" M " in text or "MALE" in text) else ("female" if (" F " in text or "FEMALE" in text) else None)
+        verified = False
+        reason = "Could not extract data from CNIC"
+        if dob_m and gen_m:
+            ed, em, ey = int(dob_m.group(1)), int(dob_m.group(2)), int(dob_m.group(3))
+            ug = str(user.gender.value if user.gender else "").lower()
+            ud = user.date_of_birth
+            if ud:
+                if ud.day == ed and ud.month == em and ud.year == ey and ug == gen_m:
+                    verified = True
+                    reason = "Verification successful"
+                elif not (ud.day == ed and ud.month == em and ud.year == ey):
+                    reason = "Date of birth does not match"
+                else:
+                    reason = "Gender does not match"
+            else:
+                reason = "No date of birth in profile"
+        user.verification_status = "verified" if verified else "rejected"
+        db.commit()
+        return {"success": True, "verification_status": user.verification_status, "message": reason, "doc_url": doc_url}
+    except Exception as ex:
+        user.verification_status = "pending"
+        db.commit()
+        return {"success": True, "verification_status": "pending", "message": "Auto verification failed.", "doc_url": doc_url}
 
 @router.get("/verification-status")
 def get_verification_status(
