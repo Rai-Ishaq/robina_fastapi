@@ -314,11 +314,11 @@ def get_profile(
 
 @router.post("/verify-identity")
 async def verify_identity(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db),
 ):
-    """Upload CNIC photo for yellow badge verification"""
     try:
         contents = await file.read()
         upload_result = cloudinary.uploader.upload(
@@ -334,6 +334,15 @@ async def verify_identity(
 
     user = db.query(User).filter(User.id == current_user.id).first()
     user.verification_doc_url = doc_url
+    user.verification_status = "pending"
+    db.commit()
+    background_tasks.add_task(_verify_cnic_bg, str(current_user.id), contents)
+    return {"success": True, "verification_status": "pending", "message": "CNIC uploaded. Verification in progress...", "doc_url": doc_url}
+
+
+def _verify_cnic_bg(user_id: str, contents: bytes):
+    from app.database import SessionLocal
+    db = SessionLocal()
     try:
         import easyocr, numpy as np, re, io
         from PIL import Image
@@ -343,30 +352,30 @@ async def verify_identity(
         text = " ".join(results).upper()
         dob_m = re.search(r"(\d{2})[.\-/](\d{2})[.\-/](\d{4})", text)
         gen_m = "male" if (" M " in text or "MALE" in text) else ("female" if (" F " in text or "FEMALE" in text) else None)
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            return
         verified = False
-        reason = "Could not extract data from CNIC"
         if dob_m and gen_m:
             ed, em, ey = int(dob_m.group(1)), int(dob_m.group(2)), int(dob_m.group(3))
             ug = str(user.gender.value if user.gender else "").lower()
             ud = user.date_of_birth
-            if ud:
-                if ud.day == ed and ud.month == em and ud.year == ey and ug == gen_m:
-                    verified = True
-                    reason = "Verification successful"
-                elif not (ud.day == ed and ud.month == em and ud.year == ey):
-                    reason = "Date of birth does not match"
-                else:
-                    reason = "Gender does not match"
-            else:
-                reason = "No date of birth in profile"
+            if ud and ud.day == ed and ud.month == em and ud.year == ey and ug == gen_m:
+                verified = True
         user.verification_status = "verified" if verified else "rejected"
         db.commit()
-        return {"success": True, "verification_status": user.verification_status, "message": reason, "doc_url": doc_url}
-    except Exception as ex:
-        user.verification_status = "pending"
-        db.commit()
-        return {"success": True, "verification_status": "pending", "message": "Auto verification failed.", "doc_url": doc_url}
-
+        print(f"[VERIFY] {user_id}: {user.verification_status}")
+    except Exception as e:
+        print(f"[VERIFY ERROR] {e}")
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            if user:
+                user.verification_status = "pending"
+                db.commit()
+        except:
+            pass
+    finally:
+        db.close()
 @router.get("/verification-status")
 def get_verification_status(
     current_user: User = Depends(get_verified_user),
