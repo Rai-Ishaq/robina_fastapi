@@ -28,8 +28,7 @@ class ConnectionManager:
     def __init__(self):
         self.connections: Dict[str, WebSocket] = {}
         self.online_users: Set[str] = set()
-        # ✅ FIX: Track which conversation each user is actively viewing
-        self.active_conversations: Dict[str, str] = {}  # user_id -> conversation_id
+        self.active_conversations: Dict[str, str] = {}
 
     async def connect(self, user_id: str, ws: WebSocket):
         await ws.accept()
@@ -48,14 +47,12 @@ class ConnectionManager:
         return list(self.online_users)
 
     def set_active_conversation(self, user_id: str, conv_id: str):
-        """Track which conversation user is currently viewing"""
         self.active_conversations[user_id] = conv_id
 
     def clear_active_conversation(self, user_id: str):
         self.active_conversations.pop(user_id, None)
 
     def is_in_conversation(self, user_id: str, conv_id: str) -> bool:
-        """Check if user is actively viewing this conversation"""
         return self.active_conversations.get(user_id) == conv_id
 
     async def send_to(self, user_id: str, data: dict):
@@ -98,16 +95,30 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
     user.last_seen = None
     db.commit()
 
-    # Notify all conversation partners that this user is online
+    # Get all conversations for this user
     conversations = db.query(Conversation).filter(
         or_(Conversation.user1_id == user_id, Conversation.user2_id == user_id)
     ).all()
 
+    # ✅ Step 1: Notify all partners that THIS user is now online
     for conv in conversations:
         other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
         await manager.send_to(other_id, {
             "type": "user_online",
             "user_id": str(user_id),
+        })
+
+    # ✅ Step 2: Tell THIS user which of their contacts are already online
+    already_online = []
+    for conv in conversations:
+        other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
+        if manager.is_online(other_id):
+            already_online.append(other_id)
+
+    if already_online:
+        await manager.send_to(str(user_id), {
+            "type": "online_users_list",
+            "user_ids": already_online,
         })
 
     try:
@@ -123,7 +134,6 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
             if mtype == "ping":
                 await manager.send_to(str(user_id), {"type": "pong"})
 
-            # ✅ FIX: Track active conversation from Flutter
             elif mtype == "set_active_conversation":
                 conv_id = msg.get("conversation_id", "")
                 if conv_id:
@@ -139,7 +149,6 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                 if not content or not receiver_id:
                     continue
 
-                # Check if blocked
                 is_blocked = db.query(BlockedUser).filter(
                     or_(
                         and_(BlockedUser.blocker_id == user_id, BlockedUser.blocked_id == receiver_id),
@@ -171,18 +180,14 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                     db.add(conv)
                     db.flush()
 
-                # ✅ FIX: Check if receiver is online AND actively in this conversation
                 receiver_online = manager.is_online(str(receiver_id))
                 receiver_in_conv = manager.is_in_conversation(str(receiver_id), str(conv.id))
 
                 if receiver_in_conv:
-                    # Receiver is actively viewing this chat → seen immediately
                     status = MessageStatus.seen
                 elif receiver_online:
-                    # Receiver is online but not in this chat → delivered
                     status = MessageStatus.delivered
                 else:
-                    # Receiver is offline → sent
                     status = MessageStatus.sent
 
                 new_msg = Message(
@@ -211,11 +216,9 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                     "quote_sender": msg.get("quote_sender"),
                 }
 
-                # Send to both sender and receiver
                 await manager.send_to(str(user_id), payload_out)
                 await manager.send_to(str(receiver_id), payload_out)
 
-                # ✅ FIX: If receiver is in conversation, immediately send seen confirmation to sender
                 if receiver_in_conv:
                     await manager.send_to(str(user_id), {
                         "type": "messages_seen",
@@ -240,7 +243,6 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                 if not conv_id:
                     continue
 
-                # ✅ FIX: Update DB
                 msgs_to_update = db.query(Message).filter(
                     Message.conversation_id == conv_id,
                     Message.sender_id != user_id,
@@ -252,7 +254,6 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                     m.status = MessageStatus.seen
                 db.commit()
 
-                # ✅ FIX: Notify the OTHER user (sender) that their messages were seen
                 conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
                 if conv and updated > 0:
                     other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
@@ -370,7 +371,6 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
             "last_message_type": last_msg.media_type if last_msg else None,
             "last_message_time": last_msg.created_at.isoformat() if last_msg else conv.created_at.isoformat(),
             "unread_count": unread_count,
-            # ✅ FIX: Real-time online status from manager
             "is_online": manager.is_online(other_id_str),
             "last_seen": other.last_seen.isoformat() if other.last_seen else None,
             "updated_at": conv.updated_at.isoformat() if conv.updated_at else conv.created_at.isoformat(),
@@ -381,14 +381,12 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
     return result
 
 
-# ✅ FIX: New REST endpoint — persistent mark as read
 @router.post("/conversations/{conversation_id}/read")
 async def mark_conversation_read(
     conversation_id: str,
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db)
 ):
-    """Mark all messages in a conversation as seen — called when user opens chat"""
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if not conv:
         return {"success": False}
@@ -407,7 +405,6 @@ async def mark_conversation_read(
         m.status = MessageStatus.seen
     db.commit()
 
-    # ✅ Notify the sender that their messages were seen
     if updated_count > 0:
         other_id = str(conv.user2_id if str(conv.user1_id) == str(current_user.id) else conv.user1_id)
         import asyncio
@@ -752,7 +749,6 @@ def get_user_status(
 
 @router.get("/online-users")
 def get_online_users(current_user: User = Depends(get_verified_user)):
-    """Get list of currently online user IDs"""
     return {"online_user_ids": manager.get_online_user_ids()}
 
 
