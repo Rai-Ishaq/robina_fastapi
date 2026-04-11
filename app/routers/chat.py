@@ -2,6 +2,7 @@ import json
 import cloudinary
 import cloudinary.uploader
 import os
+from datetime import datetime
 from typing import Dict, Set
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
 from sqlalchemy.orm import Session
@@ -27,6 +28,8 @@ class ConnectionManager:
     def __init__(self):
         self.connections: Dict[str, WebSocket] = {}
         self.online_users: Set[str] = set()
+        # ✅ FIX: Track which conversation each user is actively viewing
+        self.active_conversations: Dict[str, str] = {}  # user_id -> conversation_id
 
     async def connect(self, user_id: str, ws: WebSocket):
         await ws.accept()
@@ -36,12 +39,24 @@ class ConnectionManager:
     def disconnect(self, user_id: str):
         self.connections.pop(user_id, None)
         self.online_users.discard(user_id)
+        self.active_conversations.pop(user_id, None)
 
     def is_online(self, user_id: str) -> bool:
         return user_id in self.online_users
 
     def get_online_user_ids(self) -> list:
         return list(self.online_users)
+
+    def set_active_conversation(self, user_id: str, conv_id: str):
+        """Track which conversation user is currently viewing"""
+        self.active_conversations[user_id] = conv_id
+
+    def clear_active_conversation(self, user_id: str):
+        self.active_conversations.pop(user_id, None)
+
+    def is_in_conversation(self, user_id: str, conv_id: str) -> bool:
+        """Check if user is actively viewing this conversation"""
+        return self.active_conversations.get(user_id) == conv_id
 
     async def send_to(self, user_id: str, data: dict):
         ws = self.connections.get(user_id)
@@ -108,6 +123,14 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
             if mtype == "ping":
                 await manager.send_to(str(user_id), {"type": "pong"})
 
+            # ✅ FIX: Track active conversation from Flutter
+            elif mtype == "set_active_conversation":
+                conv_id = msg.get("conversation_id", "")
+                if conv_id:
+                    manager.set_active_conversation(str(user_id), conv_id)
+                else:
+                    manager.clear_active_conversation(str(user_id))
+
             elif mtype == "send_message":
                 receiver_id = msg.get("receiver_id", "")
                 content = msg.get("content", "").strip()
@@ -148,9 +171,19 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                     db.add(conv)
                     db.flush()
 
-                # If receiver is online AND in this conversation → mark seen immediately
+                # ✅ FIX: Check if receiver is online AND actively in this conversation
                 receiver_online = manager.is_online(str(receiver_id))
-                status = MessageStatus.seen if receiver_online else MessageStatus.sent
+                receiver_in_conv = manager.is_in_conversation(str(receiver_id), str(conv.id))
+
+                if receiver_in_conv:
+                    # Receiver is actively viewing this chat → seen immediately
+                    status = MessageStatus.seen
+                elif receiver_online:
+                    # Receiver is online but not in this chat → delivered
+                    status = MessageStatus.delivered
+                else:
+                    # Receiver is offline → sent
+                    status = MessageStatus.sent
 
                 new_msg = Message(
                     conversation_id=conv.id,
@@ -161,9 +194,6 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                     quote_sender=msg.get("quote_sender"),
                 )
                 db.add(new_msg)
-
-                # Update conversation updated_at
-                from datetime import datetime
                 conv.updated_at = datetime.utcnow()
                 db.commit()
                 db.refresh(new_msg)
@@ -181,8 +211,17 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                     "quote_sender": msg.get("quote_sender"),
                 }
 
+                # Send to both sender and receiver
                 await manager.send_to(str(user_id), payload_out)
                 await manager.send_to(str(receiver_id), payload_out)
+
+                # ✅ FIX: If receiver is in conversation, immediately send seen confirmation to sender
+                if receiver_in_conv:
+                    await manager.send_to(str(user_id), {
+                        "type": "messages_seen",
+                        "conversation_id": str(conv.id),
+                        "seen_by": str(receiver_id),
+                    })
 
                 if not receiver_online and receiver.fcm_token:
                     send_push_notification(
@@ -201,18 +240,21 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
                 if not conv_id:
                     continue
 
+                # ✅ FIX: Update DB
                 msgs_to_update = db.query(Message).filter(
                     Message.conversation_id == conv_id,
                     Message.sender_id != user_id,
                     Message.status != MessageStatus.seen,
                 ).all()
 
+                updated = len(msgs_to_update)
                 for m in msgs_to_update:
                     m.status = MessageStatus.seen
                 db.commit()
 
+                # ✅ FIX: Notify the OTHER user (sender) that their messages were seen
                 conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
-                if conv:
+                if conv and updated > 0:
                     other_id = str(conv.user2_id if str(conv.user1_id) == str(user_id) else conv.user1_id)
                     await manager.send_to(other_id, {
                         "type": "messages_seen",
@@ -273,7 +315,6 @@ async def websocket_endpoint(ws: WebSocket, token: str = Query(...), db: Session
         pass
     finally:
         manager.disconnect(str(user_id))
-        from datetime import datetime
         user.is_online = False
         user.last_seen = datetime.utcnow()
         db.commit()
@@ -293,7 +334,6 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
         or_(Conversation.user1_id == current_user.id, Conversation.user2_id == current_user.id)
     ).order_by(desc(Conversation.updated_at)).all()
 
-    # Get users this person has blocked / blocked by
     my_blocks = {str(b.blocked_id) for b in db.query(BlockedUser).filter(BlockedUser.blocker_id == current_user.id).all()}
     blocked_me = {str(b.blocker_id) for b in db.query(BlockedUser).filter(BlockedUser.blocked_id == current_user.id).all()}
 
@@ -330,6 +370,7 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
             "last_message_type": last_msg.media_type if last_msg else None,
             "last_message_time": last_msg.created_at.isoformat() if last_msg else conv.created_at.isoformat(),
             "unread_count": unread_count,
+            # ✅ FIX: Real-time online status from manager
             "is_online": manager.is_online(other_id_str),
             "last_seen": other.last_seen.isoformat() if other.last_seen else None,
             "updated_at": conv.updated_at.isoformat() if conv.updated_at else conv.created_at.isoformat(),
@@ -338,6 +379,48 @@ def get_conversations(current_user: User = Depends(get_verified_user), db: Sessi
             "other_user_code": other.user_code or "",
         })
     return result
+
+
+# ✅ FIX: New REST endpoint — persistent mark as read
+@router.post("/conversations/{conversation_id}/read")
+async def mark_conversation_read(
+    conversation_id: str,
+    current_user: User = Depends(get_verified_user),
+    db: Session = Depends(get_db)
+):
+    """Mark all messages in a conversation as seen — called when user opens chat"""
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if not conv:
+        return {"success": False}
+
+    if str(conv.user1_id) != str(current_user.id) and str(conv.user2_id) != str(current_user.id):
+        return {"success": False}
+
+    msgs_updated = db.query(Message).filter(
+        Message.conversation_id == conversation_id,
+        Message.sender_id != current_user.id,
+        Message.status != MessageStatus.seen
+    ).all()
+
+    updated_count = len(msgs_updated)
+    for m in msgs_updated:
+        m.status = MessageStatus.seen
+    db.commit()
+
+    # ✅ Notify the sender that their messages were seen
+    if updated_count > 0:
+        other_id = str(conv.user2_id if str(conv.user1_id) == str(current_user.id) else conv.user1_id)
+        import asyncio
+        try:
+            asyncio.ensure_future(manager.send_to(other_id, {
+                "type": "messages_seen",
+                "conversation_id": conversation_id,
+                "seen_by": str(current_user.id),
+            }))
+        except Exception:
+            pass
+
+    return {"success": True, "updated": updated_count}
 
 
 @router.get("/messages/{conversation_id}")
@@ -391,7 +474,6 @@ def send_message_rest(
     if not content or not receiver_id:
         return {"success": False, "error": "Missing fields"}
 
-    # Check block
     is_blocked = db.query(BlockedUser).filter(
         or_(
             and_(BlockedUser.blocker_id == current_user.id, BlockedUser.blocked_id == receiver_id),
@@ -424,7 +506,15 @@ def send_message_rest(
         db.flush()
 
     receiver_online = manager.is_online(str(receiver_id))
-    status = MessageStatus.seen if receiver_online else MessageStatus.sent
+    receiver_in_conv = manager.is_in_conversation(str(receiver_id), str(conv.id))
+
+    if receiver_in_conv:
+        status = MessageStatus.seen
+    elif receiver_online:
+        status = MessageStatus.delivered
+    else:
+        status = MessageStatus.sent
+
     new_msg = Message(
         conversation_id=conv.id,
         sender_id=current_user.id,
@@ -434,7 +524,6 @@ def send_message_rest(
         quote_sender=body.get("quote_sender"),
     )
     db.add(new_msg)
-    from datetime import datetime
     conv.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(new_msg)
@@ -457,6 +546,12 @@ def send_message_rest(
         loop = asyncio.get_running_loop()
         asyncio.ensure_future(manager.send_to(str(receiver_id), payload_out))
         asyncio.ensure_future(manager.send_to(str(current_user.id), payload_out))
+        if receiver_in_conv:
+            asyncio.ensure_future(manager.send_to(str(current_user.id), {
+                "type": "messages_seen",
+                "conversation_id": str(conv.id),
+                "seen_by": str(receiver_id),
+            }))
     except Exception:
         pass
 
@@ -494,7 +589,6 @@ async def send_media(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db),
 ):
-    # Check block
     is_blocked = db.query(BlockedUser).filter(
         or_(
             and_(BlockedUser.blocker_id == current_user.id, BlockedUser.blocked_id == receiver_id),
@@ -516,9 +610,6 @@ async def send_media(
         thumbnail = None
         if media_type == "video":
             thumbnail = upload_result.get("url", "").replace("/upload/", "/upload/w_200,h_200,c_fill/")
-        if media_type == "audio":
-            # For audio duration from cloudinary
-            pass
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -541,7 +632,14 @@ async def send_media(
 
     content_text = {"image": "📷 Photo", "video": "🎥 Video", "audio": "🎤 Voice"}.get(media_type, "📎 File")
     receiver_online = manager.is_online(str(receiver_id))
-    status = MessageStatus.seen if receiver_online else MessageStatus.sent
+    receiver_in_conv = manager.is_in_conversation(str(receiver_id), str(conv.id))
+
+    if receiver_in_conv:
+        status = MessageStatus.seen
+    elif receiver_online:
+        status = MessageStatus.delivered
+    else:
+        status = MessageStatus.sent
 
     new_msg = Message(
         conversation_id=conv.id,
@@ -555,7 +653,6 @@ async def send_media(
         quote_sender=quote_sender,
     )
     db.add(new_msg)
-    from datetime import datetime
     conv.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(new_msg)
@@ -579,6 +676,12 @@ async def send_media(
         loop = asyncio.get_running_loop()
         asyncio.ensure_future(manager.send_to(str(receiver_id), payload_out))
         asyncio.ensure_future(manager.send_to(str(current_user.id), payload_out))
+        if receiver_in_conv:
+            asyncio.ensure_future(manager.send_to(str(current_user.id), {
+                "type": "messages_seen",
+                "conversation_id": str(conv.id),
+                "seen_by": str(receiver_id),
+            }))
     except Exception:
         pass
 
@@ -600,6 +703,7 @@ async def send_media(
             "media_thumbnail": thumbnail,
             "content": content_text,
             "created_at": new_msg.created_at.isoformat(),
+            "status": new_msg.status.value,
         }
     }
 
@@ -624,7 +728,6 @@ def clear_chat(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db),
 ):
-    """Clear all messages from a conversation (for current user only — deletes from DB)"""
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if conv and (str(conv.user1_id) == str(current_user.id) or str(conv.user2_id) == str(current_user.id)):
         db.query(Message).filter(Message.conversation_id == conversation_id).delete()
@@ -735,6 +838,5 @@ def report_user(
     current_user: User = Depends(get_verified_user),
     db: Session = Depends(get_db),
 ):
-    # Log report (simple implementation — just log for now)
     print(f"[REPORT] User {current_user.id} reported {target_user_id}. Reason: {reason}")
     return {"success": True, "message": "Report submitted successfully"}
