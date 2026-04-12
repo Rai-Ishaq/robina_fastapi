@@ -3,7 +3,7 @@ services:
     name: robina-fastapi
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1 --ws-ping-interval 20 --ws-ping-timeout 60
     scaling:
       minInstances: 1
       maxInstances: 1
