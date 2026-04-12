@@ -713,8 +713,15 @@ def delete_conversation(
 ):
     conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
     if conv and (str(conv.user1_id) == str(current_user.id) or str(conv.user2_id) == str(current_user.id)):
-        db.query(Message).filter(Message.conversation_id == conversation_id).delete()
-        db.delete(conv)
+        user_str = str(current_user.id)
+        messages = db.query(Message).filter(Message.conversation_id == conversation_id).all()
+        for msg in messages:
+            current_deleted = msg.deleted_by or ""
+            if user_str not in current_deleted:
+                if current_deleted:
+                    msg.deleted_by = current_deleted + "," + user_str
+                else:
+                    msg.deleted_by = user_str
         db.commit()
     return {"success": True}
 
