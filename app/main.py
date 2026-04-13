@@ -5,7 +5,7 @@ from app.database import engine, Base
 from app.routers import (
     auth, profile, matches,
     interests, chat, notifications,
-    settings, premium,calls
+    settings, premium,calls,social
 )
 import app.models.user
 import app.models.profile
@@ -18,6 +18,7 @@ import app.models.profile_view
 import app.models.premium
 import os
 import app.models.call_log
+import app.models.social
 
 Base.metadata.create_all(bind=engine)
 os.makedirs("uploads/profiles", exist_ok=True)
@@ -51,6 +52,7 @@ app.include_router(notifications.router)
 app.include_router(settings.router)
 app.include_router(premium.router)
 app.include_router(calls.router)
+app.include_router(social.router)
 
 @app.get("/")
 def root():
