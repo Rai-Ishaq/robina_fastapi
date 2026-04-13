@@ -8,7 +8,7 @@ from app.database import get_db
 from app.models.social import Post, PostLike, Comment, CommentLike
 from app.models.user import User
 from app.models.profile import Profile
-from app.routers.auth import get_current_user, get_verified_user
+from app.utils.helpers import get_current_user, get_verified_user
 import uuid
 
 router = APIRouter(prefix="/social", tags=["social"])
