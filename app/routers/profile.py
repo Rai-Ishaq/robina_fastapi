@@ -267,7 +267,6 @@ def get_profile(
             db.add(notif)
             db.commit()
 
-            # FCM Push for profile view
             if user.fcm_token:
                 send_push_notification(
                     fcm_token=user.fcm_token,
@@ -312,6 +311,8 @@ def get_profile(
         "date_of_birth": str(user.date_of_birth) if user.date_of_birth else "",
     }
 
+
+# ── VERIFY IDENTITY ───────────────────────────────────────────
 @router.post("/verify-identity")
 async def verify_identity(
     background_tasks: BackgroundTasks,
@@ -337,31 +338,68 @@ async def verify_identity(
     user.verification_status = "pending"
     db.commit()
     background_tasks.add_task(_verify_cnic_bg, str(current_user.id), contents)
-    return {"success": True, "verification_status": "pending", "message": "CNIC uploaded. Verification in progress...", "doc_url": doc_url}
+    return {
+        "success": True,
+        "verification_status": "pending",
+        "message": "CNIC uploaded. Verification in progress...",
+        "doc_url": doc_url,
+    }
 
 
+# ── VERIFY CNIC BACKGROUND (Claude API) ──────────────────────
 def _verify_cnic_bg(user_id: str, contents: bytes):
     from app.database import SessionLocal
+    import anthropic, base64, re, os
     db = SessionLocal()
     try:
-        import easyocr, numpy as np, re, io
-        from PIL import Image
-        img = Image.open(io.BytesIO(contents)).convert("RGB")
-        reader = easyocr.Reader(["en"], gpu=False, verbose=False)
-        results = reader.readtext(np.array(img), detail=0)
-        text = " ".join(results).upper()
-        dob_m = re.search(r"(\d{2})[.\-/](\d{2})[.\-/](\d{4})", text)
-        gen_m = "male" if (" M " in text or "MALE" in text) else ("female" if (" F " in text or "FEMALE" in text) else None)
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        image_data = base64.standard_b64encode(contents).decode("utf-8")
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_data,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "This is a Pakistan CNIC. Extract ONLY: 1) Date of Birth in format DD.MM.YYYY 2) Gender as M or F. Reply in this exact format only: DOB:DD.MM.YYYY GENDER:M or GENDER:F. Nothing else."
+                        }
+                    ],
+                }
+            ],
+        )
+        result = message.content[0].text.strip().upper()
+        print(f"[CLAUDE CNIC] Result: {result}")
+
+        dob_m = re.search(r"DOB:(\d{2})\.(\d{2})\.(\d{4})", result)
+        gen_m = re.search(r"GENDER:([MF])", result)
+
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             return
+
         verified = False
         if dob_m and gen_m:
             ed, em, ey = int(dob_m.group(1)), int(dob_m.group(2)), int(dob_m.group(3))
+            eg = "male" if gen_m.group(1) == "M" else "female"
             ug = str(user.gender.value if user.gender else "").lower()
             ud = user.date_of_birth
-            if ud and ud.day == ed and ud.month == em and ud.year == ey and ug == gen_m:
-                verified = True
+            if ud:
+                if ud.day == ed and ud.month == em and ud.year == ey and ug == eg:
+                    verified = True
+                    print(f"[CLAUDE CNIC] Verified!")
+                else:
+                    print(f"[CLAUDE CNIC] Mismatch — DB: {ud.day}.{ud.month}.{ud.year} {ug} | CNIC: {ed}.{em}.{ey} {eg}")
+
         user.verification_status = "verified" if verified else "rejected"
         db.commit()
         print(f"[VERIFY] {user_id}: {user.verification_status}")
@@ -376,6 +414,9 @@ def _verify_cnic_bg(user_id: str, contents: bytes):
             pass
     finally:
         db.close()
+
+
+# ── VERIFICATION STATUS ───────────────────────────────────────
 @router.get("/verification-status")
 def get_verification_status(
     current_user: User = Depends(get_verified_user),
