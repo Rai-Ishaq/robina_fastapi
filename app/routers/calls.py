@@ -9,7 +9,7 @@ from app.models.call_log import CallLog, CallStatus, CallType
 from app.models.profile import Profile
 from app.utils.helpers import get_verified_user
 from app.core.config import settings
-from app.services.firebase import send_call_notification
+from app.services.firebase import send_call_notification, send_push_notification
 from app.routers.chat import manager
 
 router = APIRouter(prefix="/calls", tags=["Calls"])
@@ -27,7 +27,7 @@ def get_agora_token(
         settings.AGORA_APP_CERTIFICATE,
         channel_name,
         uid,
-        1,  # Role_Publisher = 1
+        1,
         expire,
     )
     return {"token": token, "app_id": settings.AGORA_APP_ID}
@@ -45,7 +45,6 @@ async def initiate_call(
     if not receiver:
         return {"error": "Receiver not found"}
 
-    # Get caller profile photo
     caller_profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
     caller_photo = caller_profile.profile_photo if caller_profile else None
 
@@ -119,10 +118,8 @@ def accept_call(
 ):
     log = db.query(CallLog).filter(CallLog.id == call_log_id).first()
     if log:
-        log.status = CallStatus.completed  # Mark as answered
+        log.status = CallStatus.completed
         db.commit()
-
-        # Notify caller that call was accepted
         import asyncio
         try:
             loop = asyncio.get_running_loop()
@@ -132,7 +129,6 @@ def accept_call(
             }))
         except Exception:
             pass
-
     return {"success": True}
 
 
@@ -146,10 +142,23 @@ async def decline_call(
     if log:
         log.status = CallStatus.declined
         db.commit()
+        # ✅ WebSocket se caller ko notify karo
         await manager.send_to(str(log.caller_id), {
             "type": "call_declined",
             "call_log_id": call_log_id,
         })
+        # ✅ FCM notification bhi bhejo agar WebSocket connected nahi
+        caller = db.query(User).filter(User.id == log.caller_id).first()
+        if caller and caller.fcm_token:
+            send_push_notification(
+                fcm_token=caller.fcm_token,
+                title="Call Declined",
+                body=f"{current_user.full_name} declined your call",
+                data={
+                    "type": "call_declined",
+                    "call_log_id": call_log_id,
+                }
+            )
     return {"success": True}
 
 
@@ -162,13 +171,10 @@ async def end_call(
 ):
     log = db.query(CallLog).filter(CallLog.id == call_log_id).first()
     if log:
-        if log.status == CallStatus.missed:
-            pass  # Stay missed if never answered
-        else:
+        if log.status != CallStatus.missed:
             log.status = CallStatus.completed
         log.duration_seconds = str(duration_seconds)
         db.commit()
-
         other_id = str(log.receiver_id) if str(log.caller_id) == str(current_user.id) else str(log.caller_id)
         await manager.send_to(other_id, {
             "type": "call_ended",
@@ -197,7 +203,6 @@ def get_call_history(
         profile = db.query(Profile).filter(Profile.user_id == other_id).first()
         status_val = log.status.value if log.status else "missed"
         is_missed = (status_val == "missed") and not is_outgoing
-
         result.append({
             "id": str(log.id),
             "other_user_id": str(other_id),
