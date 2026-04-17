@@ -89,6 +89,10 @@ def get_my_profile(
         "pref_city": profile.pref_city,
         "pref_marital_status": profile.pref_marital_status,
         "pref_family_status": profile.pref_family_status,
+        "verification_status": current_user.verification_status or "none",
+        "is_premium": current_user.is_premium or False,
+        "user_code": current_user.user_code or "",
+        "created_at": current_user.created_at.isoformat() if current_user.created_at else "",
     }
 
 
