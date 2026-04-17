@@ -103,6 +103,8 @@ def get_profile_views(
             "age": None,
             "profile_photo": viewer_profile.profile_photo if viewer_profile else None,
             "viewed_at": str(view.viewed_at),
+            "verification_status": viewer.verification_status or "none",
+            "is_premium": viewer.is_premium or False,
         })
 
     return {

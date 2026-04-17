@@ -144,6 +144,8 @@ def get_matches(
             "marital_status": profile.marital_status,
             "caste": profile.caste,
             "match_score": score,
+            "verification_status": user.verification_status or "none",
+            "is_premium": user.is_premium or False,
         })
 
     profiles.sort(key=lambda x: x["match_score"], reverse=True)

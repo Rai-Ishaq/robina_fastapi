@@ -34,6 +34,8 @@ def _post_dict(post, current_user_id, db):
         "user_city": profile.city if profile else "",
         "user_photo": profile.profile_photo if profile else None,
         "user_code": user.user_code if user else "",
+        "verification_status": user.verification_status if user else "none",
+        "is_premium": user.is_premium if user else False,
         "text": post.text,
         "media_url": post.media_url,
         "media_type": post.media_type,

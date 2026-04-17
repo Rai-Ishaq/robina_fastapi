@@ -199,5 +199,7 @@ def _format_interest(interest, user, profile):
         "sender_city": profile.city if profile else None,
         "sender_photo": profile.profile_photo if profile else None,
         "sender_age": age,
-        "created_at": str(interest.created_at)
+        "created_at": str(interest.created_at),
+        "sender_verification_status": user.verification_status or "none",
+        "sender_is_premium": user.is_premium or False
     }
