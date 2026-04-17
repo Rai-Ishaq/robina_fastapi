@@ -419,7 +419,7 @@ def _verify_cnic_bg(user_id: str, contents: bytes):
 # ── VERIFICATION STATUS ───────────────────────────────────────
 @router.get("/verification-status")
 def get_verification_status(
-    current_user: User = Depends(get_verified_user),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     user = db.query(User).filter(User.id == current_user.id).first()
