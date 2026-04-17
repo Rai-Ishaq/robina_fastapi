@@ -75,6 +75,7 @@ def _comment_dict(comment, current_user_id, db, include_replies=True):
         "parent_id": str(comment.parent_id) if comment.parent_id else None,
         "replies": replies,
         "created_at": comment.created_at.isoformat(),
+        "verification_status": user.verification_status if user else "none",
     }
 
 
