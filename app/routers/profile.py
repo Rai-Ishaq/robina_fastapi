@@ -9,7 +9,7 @@ from app.schemas.profile import (
     ProfileStep4, ProfileStep5, ProfileStep6,
     ProfileResponse
 )
-from app.utils.helpers import get_verified_user
+from app.utils.helpers import get_verified_user, get_current_user
 from app.core.config import settings
 from app.services.firebase import send_push_notification
 from datetime import datetime, date
